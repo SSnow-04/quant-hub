@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Institutional Quant Hub V5.4 — Timeframe Edge Spot</title>
+    <link rel="stylesheet" href="/css/styles.css">
+    <script src="/socket.io/socket.io.js"></script>
+    <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+</head>
+<body>
+
+<div class="container">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+        <h1>⚡ Institutional Quant Hub V5.4 — Timeframe Edge Spot</h1>
+        <a href="/backtest.html" target="_blank" style="background: #8b5cf6; color: white; padding: 10px 18px; border-radius: 6px; text-decoration: none; font-weight: bold; font-size: 14px;">⏩ Launch Backtest Simulator</a>
+    </div>
+
+    <div class="wallet-bar">
+        <div class="wallet-stat">
+            <label>MANUAL TOTAL EQUITY</label>
+            <value id="wallet-balance" style="color: var(--success);">$1,000.00</value>
+        </div>
+        <div class="wallet-stat">
+            <label>AVAILABLE CASH</label>
+            <value id="wallet-cash" style="color: var(--accent);">$1,000.00</value>
+        </div>
+        <div class="wallet-stat">
+            <label>INVESTED CAPITAL</label>
+            <value id="wallet-invested" style="color: var(--warning);">$0.00</value>
+        </div>
+        <div class="wallet-stat">
+            <label>UNREALIZED PNL</label>
+            <value id="wallet-unrealized">$0.00</value>
+        </div>
+        <div class="wallet-stat">
+            <label>REALIZED PNL</label>
+            <value id="wallet-pnl">$0.00</value>
+        </div>
+    </div>
+
+    <div class="tabs">
+        <button class="tab-btn active" onclick="switchTab('scanner-tab')">📡 Live Scanner</button>
+        <button class="tab-btn" onclick="switchTab('signals-tab')">📊 Tech Signals</button>
+        <button class="tab-btn" onclick="switchTab('charts-grid-tab')">📈 Multi-Chart Grid</button>
+        <button class="tab-btn" onclick="switchTab('portfolio-tab')">🤖 Auto Portfolio</button>
+        <button class="tab-btn" onclick="switchTab('bubbles-tab')">🌐 All Assets & Bubbles</button>
+        <button class="tab-btn" onclick="switchTab('paper-logs-tab')">🧪 Paper Dashboard</button>
+        <button class="tab-btn" onclick="switchTab('closed-deals-tab')">📜 Closed Deals</button>
+    </div>
+
+    <!-- TAB 1: LIVE SCANNER -->
+    <div id="scanner-tab" class="tab-content active">
+        <div class="indicator-explainer" style="background: rgba(16, 185, 129, 0.1); border-left-color: var(--success);">
+            <strong>⚡ Real Cross-Exchange Quote Scanner:</strong>
+            <p style="margin: 5px 0 0 0;">Comparing real best bid/ask ticker quotes across Binance, Bybit, OKX, and Gate.io. Net spread is estimated after two 0.10% taker fees; execution, transfer latency and slippage are not simulated.</p>
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Asset Pair</th>
+                    <th>Arbitrage Route</th>
+                    <th>Buy Ask Price</th>
+                    <th>Sell Bid Price</th>
+                    <th>Gross Spread</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody id="scanner-body">
+                <tr><td colspan="6" style="text-align: center; color: var(--text-muted);">Streaming live order book opportunities...</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- TAB 2: TECH SIGNALS -->
+    <div id="signals-tab" class="tab-content">
+        <div class="controls-row">
+            <h3 style="margin: 0;">📊 Quantitative Screener (Spot Strategy Lab)</h3>
+            <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                <label style="color: var(--text-muted); font-size: 13px;">Strategy:</label>
+                <select id="liveStrategyProfileSelect" onchange="changeLiveStrategyProfile()" style="padding: 6px 12px; width: auto; display: inline-block;">
+                    <option value="TIMEFRAME_EDGE_SPOT" selected>V5.4 Auto Edge by Timeframe</option>
+                    <option value="EXHAUSTION_SCALP_SPOT">Legacy Oversold Exhaustion Spot</option>
+                    <option value="TREND_PULLBACK_SPOT">Legacy Trend Pullback Spot</option>
+                    <option value="MOMENTUM_BREAKOUT_SPOT">Momentum Breakout Spot</option>
+                    <option value="RESEARCH_SPOT">Research Spot (Broad Control)</option>
+                    <option value="V4_REGIME_SPOT">V4 Regime Spot (Strict Control)</option>
+                    <option value="V3_BASELINE">V3 Baseline</option>
+                </select>
+                <label style="color: var(--text-muted); font-size: 13px;">Timeframe:</label>
+                <select id="timeframeSelect" onchange="changeTimeframe()" style="padding: 6px 12px; width: auto; display: inline-block;">
+                    <option value="1m">1 Minute</option>
+                    <option value="3m">3 Minutes</option>
+                    <option value="5m" selected>5 Minutes (Exhaustion Recommended)</option>
+                    <option value="15m">15 Minutes</option>
+                    <option value="30m">30 Minutes (Pullback Recommended)</option>
+                    <option value="1h">1 Hour</option>
+                    <option value="2h">2 Hours</option>
+                    <option value="4h">4 Hours</option>
+                    <option value="6h">6 Hours</option>
+                    <option value="8h">8 Hours</option>
+                    <option value="12h">12 Hours</option>
+                    <option value="1d">1 Day</option>
+                    <option value="3d">3 Days</option>
+                    <option value="1w">1 Week</option>
+                </select>
+            </div>
+        </div>
+        <div id="liveRegimeBanner" class="indicator-explainer" style="margin-bottom:15px;">
+            <strong>BTC Higher-Timeframe Spot Regime:</strong> waiting for V5 analysis…
+        </div>
+        <div style="margin-bottom: 15px; background: rgba(16, 185, 129, 0.1); padding: 10px; border-radius: 4px; border: 1px solid var(--success);">
+            <label style="cursor: pointer; display: flex; align-items: center; gap: 8px; font-weight: bold; color: var(--success);">
+                <input type="checkbox" id="spotFilterToggle" checked onchange="toggleSpotFilter()"> 
+                🎯 SPOT MODE: Only Show 'Buy' & 'Strong Buy' Signals (Hide Bearish Coins)
+            </label>
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th class="sortable-header" onclick="sortSignals('pair')">Asset Pair ⇕</th>
+                    <th class="sortable-header" onclick="sortSignals('price')">Price & BB Width ⇕</th>
+                    <th class="sortable-header" onclick="sortSignals('momentum')">Momentum & Stoch ⇕</th>
+                    <th class="sortable-header" onclick="sortSignals('trend')">EMA & VWAP ⇕</th>
+                    <th class="sortable-header" onclick="sortSignals('smc')">SMC, ADX & System Consensus ⇕</th>
+                    <th class="sortable-header" onclick="sortSignals('consensus')">Consensus Rating ⇕</th>
+                    <th class="sortable-header" onclick="sortSignals('atr')">Dynamic Scaled ATR Targets (1.5x SL / 1.0x-3.5x TP) ⇕</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody id="signals-body">
+                <tr><td colspan="8" style="text-align: center; color: var(--text-muted);">Awaiting data... Screener loading.</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- TAB: MULTI-CHART GRID -->
+    <div id="charts-grid-tab" class="tab-content">
+        <div class="controls-row" style="margin-bottom: 15px;">
+            <h3 style="margin: 0; color: var(--accent);">📈 Live Interactive Multi-Chart Grid</h3>
+            <div style="display: flex; gap: 10px;">
+                <select id="gridPresetSelect" onchange="loadChartGridPreset()" style="padding: 6px 12px; width: auto;">
+                    <option value="2x2" selected>4 Charts Grid (2x2)</option>
+                    <option value="1x2">2 Charts Side-by-Side (1x2)</option>
+                    <option value="1x1">Single Expanded Chart</option>
+                </select>
+            </div>
+        </div>
+
+        <div id="tv-grid-container" style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; height: 750px; width: 100%;">
+            <div id="tv_chart_1" style="height: 100%; border-radius: 6px; overflow: hidden; border: 1px solid var(--border);"></div>
+            <div id="tv_chart_2" style="height: 100%; border-radius: 6px; overflow: hidden; border: 1px solid var(--border);"></div>
+            <div id="tv_chart_3" style="height: 100%; border-radius: 6px; overflow: hidden; border: 1px solid var(--border);"></div>
+            <div id="tv_chart_4" style="height: 100%; border-radius: 6px; overflow: hidden; border: 1px solid var(--border);"></div>
+        </div>
+    </div>
+
+    <!-- TAB 3: AUTO PORTFOLIO -->
+    <div id="portfolio-tab" class="tab-content">
+        <h3>🤖 Automated Tech-Signals Portfolio Builder</h3>
+        <div class="sub-text" style="margin-bottom:10px;">Uses the same strategy profile and BUY/STRONG BUY signals currently selected in Tech Signals.</div>
+        
+        <div class="wallet-bar" style="background: rgba(139, 92, 246, 0.1); border-color: #8b5cf6; margin-bottom: 20px;">
+            <div class="wallet-stat">
+                <label style="color: #c4b5fd;">AUTO PORTFOLIO EQUITY</label>
+                <value id="auto-wallet-balance" style="color: #a78bfa;">$1,000.00</value>
+            </div>
+            <div class="wallet-stat">
+                <label style="color: #c4b5fd;">VAULT CASH</label>
+                <value id="auto-wallet-cash" style="color: var(--success);">$1,000.00</value>
+            </div>
+            <div class="wallet-stat">
+                <label style="color: #c4b5fd;">INVESTED IN PORTFOLIO</label>
+                <value id="auto-wallet-invested" style="color: var(--warning);">$0.00</value>
+            </div>
+            <div class="wallet-stat">
+                <label style="color: #c4b5fd;">FLOATING PNL</label>
+                <value id="auto-wallet-unrealized">$0.00</value>
+            </div>
+            <div class="wallet-stat">
+                <label style="color: #c4b5fd;">REALIZED PNL / LOSSES</label>
+                <value id="auto-wallet-pnl">$0.00</value>
+            </div>
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr 1fr; gap: 15px; margin-bottom: 20px; background: var(--bg-dark); padding: 15px; border-radius: 6px; border: 1px solid var(--border);">
+            <div>
+                <label style="color: var(--text-muted); font-size: 12px; display: block; margin-bottom: 5px;">Timeframe</label>
+                <select id="portfolioTimeframeSelect" onchange="changePortfolioTimeframe()">
+                    <option value="1m">1 Minute</option>
+                    <option value="3m">3 Minutes</option>
+                    <option value="5m" selected>5 Minutes (Exhaustion Recommended)</option>
+                    <option value="15m">15 Minutes</option>
+                    <option value="30m">30 Minutes (Pullback Recommended)</option>
+                    <option value="1h">1 Hour</option>
+                    <option value="2h">2 Hours</option>
+                    <option value="4h">4 Hours</option>
+                    <option value="6h">6 Hours</option>
+                    <option value="8h">8 Hours</option>
+                    <option value="12h">12 Hours</option>
+                    <option value="1d">1 Day</option>
+                    <option value="3d">3 Days</option>
+                    <option value="1w">1 Week</option>
+                </select>
+            </div>
+            <div>
+                <label style="color: var(--text-muted); font-size: 12px; display: block; margin-bottom: 5px;">Capital Pool ($)</label>
+                <input type="number" id="portfolioBudget" value="1000" oninput="calculatePortfolioAllocation()">
+            </div>
+            <div>
+                <label style="color: var(--text-muted); font-size: 12px; display: block; margin-bottom: 5px;">Max Coins</label>
+                <select id="maxPortfolioCoins" onchange="calculatePortfolioAllocation()">
+                    <option value="3">Top 3 Coins</option>
+                    <option value="5" selected>Top 5 Coins</option>
+                    <option value="10">Top 10 Coins</option>
+                    <option value="ALL">All Buy Signals</option>
+                </select>
+            </div>
+            <div>
+                <label style="color: var(--text-muted); font-size: 12px; display: block; margin-bottom: 5px;">Default Exit Target</label>
+                <select id="portfolioTpLevel" onchange="calculatePortfolioAllocation()">
+                    <option value="AUTO" selected>AUTO V5 (30m→TP2, 1h+→TP3)</option>
+                    <option value="TP2">TP2 (2.0x ATR)</option>
+                    <option value="TP3">TP3 (3.5x ATR)</option>
+                    <option value="TP1">TP1 (Research Only)</option>
+                </select>
+            </div>
+            <div style="display: flex; align-items: flex-end;">
+                <button class="action-btn" style="width: 100%; padding: 10px; background: #8b5cf6;" onclick="deployPortfolio()">🚀 Deploy Portfolio</button>
+            </div>
+        </div>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>Rank</th>
+                    <th>Asset Pair</th>
+                    <th>Consensus Rating</th>
+                    <th>Selected Target Upside</th>
+                    <th>Assigned Capital ($)</th>
+                    <th>Target Stop Loss (-1.5x ATR)</th>
+                    <th>Limit Take Profit Exit</th>
+                </tr>
+            </thead>
+            <tbody id="portfolio-allocation-body">
+                <tr><td colspan="7" style="text-align: center; color: var(--text-muted);">Ranking the same BUY-qualified coins shown in Tech Signals...</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- TAB 4: ALL ASSETS & CRYPTO BUBBLES -->
+    <div id="bubbles-tab" class="tab-content">
+        <h3>🌐 Supported Trading Pairs & Crypto Bubbles</h3>
+        <div id="pairs-container" style="max-height: 180px; overflow-y: auto; background: var(--bg-dark); padding: 10px; border-radius: 6px; border: 1px solid var(--border); margin-bottom: 25px;">
+            <div style="text-align: center; color: var(--text-muted);">Loading supported asset directory...</div>
+        </div>
+
+        <h3>🫧 Interactive Crypto Bubbles</h3>
+        <div style="width: 100%; height: 600px; border-radius: 8px; overflow: hidden; border: 1px solid var(--border);">
+            <iframe src="https://cryptobubbles.net" style="width: 100%; height: 100%; border: none;"></iframe>
+        </div>
+    </div>
+
+    <!-- TAB 5: PAPER TRADING DASHBOARD -->
+    <div id="paper-logs-tab" class="tab-content">
+        <div class="controls-row">
+            <h3 style="margin: 0; color: var(--accent);">📍 Active Manual & Auto Positions (Adaptive Max-Hold + Signal Exit)</h3>
+            <div>
+                <button class="action-btn" onclick="openImportModal()" style="padding: 6px 12px; font-size: 12px; margin-right: 8px;">📥 Import Wallet JSON</button>
+                <button class="action-btn stop" onclick="resetAccount()" style="padding: 6px 12px; font-size: 12px;">🗑️ Reset Account & Clear All</button>
+            </div>
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Time / Max Hold</th>
+                    <th>Pair</th>
+                    <th>Trigger Source</th>
+                    <th>Exit Signal Status</th>
+                    <th>Size (DCA Entries)</th>
+                    <th>Avg Buy Price</th>
+                    <th>Limit Target TP</th>
+                    <th>Stop Loss</th>
+                    <th>Status</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody id="manual-positions-body">
+                <tr><td colspan="11" style="text-align: center; color: var(--text-muted);">No manual open positions active.</td></tr>
+            </tbody>
+        </table>
+
+        <h3 style="margin-top: 35px; color: #a78bfa;">🤖 Active Auto Portfolio Positions (Adaptive Max-Hold + Signal Exit)</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Time / Max Hold</th>
+                    <th>Pair</th>
+                    <th>Trigger Source</th>
+                    <th>Exit Signal Status</th>
+                    <th>Size (DCA Entries)</th>
+                    <th>Avg Buy Price</th>
+                    <th>Limit Target TP</th>
+                    <th>Stop Loss</th>
+                    <th>Status</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody id="auto-positions-body">
+                <tr><td colspan="11" style="text-align: center; color: var(--text-muted);">No auto portfolio open positions active.</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- TAB 6: CLOSED DEALS -->
+    <div id="closed-deals-tab" class="tab-content">
+        <div class="controls-row">
+            <h3 style="margin: 0; color: var(--warning);">📜 Closed Deals & Signal Study Analytics</h3>
+            <div>
+                <label style="color: var(--text-muted); font-size: 13px; margin-right: 8px;">Filter by Signal:</label>
+                <select id="signalFilterSelect" onchange="renderClosedDealsTable()" style="padding: 6px 12px; width: auto; display: inline-block;">
+                    <option value="ALL" selected>🔍 All Signals (Combined)</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="wallet-bar" style="background: rgba(245, 158, 11, 0.1); border-color: var(--warning); margin: 20px 0;">
+            <div class="wallet-stat">
+                <label style="color: #fcd34d;">FILTERED DEALS</label>
+                <value id="stat-total-deals" style="color: white;">0</value>
+            </div>
+            <div class="wallet-stat">
+                <label style="color: #fcd34d;">FILTERED WIN RATE</label>
+                <value id="stat-win-rate" style="color: var(--success);">0.0%</value>
+            </div>
+            <div class="wallet-stat">
+                <label style="color: #fcd34d;">WINS / LOSSES</label>
+                <value id="stat-wl-count" style="color: var(--accent);">0W / 0L</value>
+            </div>
+            <div class="wallet-stat">
+                <label style="color: #fcd34d;">FILTERED NET PNL</label>
+                <value id="stat-net-pnl">$0.00</value>
+            </div>
+        </div>
+
+        <h4 style="margin-top: 30px; color: var(--accent);">📊 Indicator / Signal Performance Study (Tighter Edge Breakdown)</h4>
+        <table>
+            <thead>
+                <tr>
+                    <th>Signal Source / Indicator</th>
+                    <th>Total Trades</th>
+                    <th>Win Rate (%)</th>
+                    <th>Wins / Losses</th>
+                    <th>Net P/L ($)</th>
+                </tr>
+            </thead>
+            <tbody id="signal-stats-body">
+                <tr><td colspan="5" style="text-align: center; color: var(--text-muted);">Awaiting closed trade data for study...</td></tr>
+            </tbody>
+        </table>
+
+        <h4 style="margin-top: 35px; color: var(--text-main);">📋 Detailed Closed Deal Logs</h4>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Timeframe</th>
+                    <th>Entry Time</th>
+                    <th>Closed Time</th>
+                    <th>Type</th>
+                    <th>Pair</th>
+                    <th>Entry Signal (IN)</th>
+                    <th>Indicator Snapshot at Entry</th>
+                    <th>Exit Reason (OUT)</th>
+                    <th>Size (DCA Count)</th>
+                    <th>Avg Entry Price</th>
+                    <th>Exit Price</th>
+                    <th>Net P/L (Total Fees)</th>
+                </tr>
+            </thead>
+            <tbody id="logs-body">
+                <tr><td colspan="13" style="text-align: center; color: var(--text-muted);">No closed deals yet.</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- DYNAMIC PAPER TRADING MODAL -->
+<div id="tradeModal" class="modal">
+    <div class="modal-content">
+        <h2 id="modalTitle" class="modal-title">🧪 Execute Paper Trade</h2>
+        <div id="modalSubtitle" class="modal-subtitle"></div>
+        <div class="grid" style="margin-bottom: 25px;">
+            <div style="grid-column: span 2;">
+                <label style="color: var(--success); font-weight: bold;">Trade Size in USD (Available Cash: <span id="modalBalance"></span>)</label>
+                <input type="number" id="modalAmount" value="100">
+            </div>
+            <div style="grid-column: span 2;">
+                <label style="color: var(--accent); font-weight: bold;">Take Profit Exit Selection</label>
+                <select id="modalTpTargetSelect" onchange="applyModalTargetChoice()">
+                    <option value="TP1">Target TP1 (1.0x ATR)</option>
+                    <option value="TP2" selected>Target TP2 (2.0x ATR)</option>
+                    <option value="TP3">Target TP3 (3.5x ATR)</option>
+                </select>
+            </div>
+            <div>
+                <label style="color: var(--success);">Limit Exit Profit (%)</label>
+                <input type="number" id="modalTpPct">
+            </div>
+            <div>
+                <label style="color: var(--success);">Limit Exit Price ($)</label>
+                <input type="number" id="modalTpPrice">
+            </div>
+            <div>
+                <label style="color: var(--danger);">Stop Loss (%)</label>
+                <input type="number" id="modalSlPct">
+            </div>
+            <div>
+                <label style="color: var(--danger);">Stop Loss Price ($)</label>
+                <input type="number" id="modalSlPrice">
+            </div>
+        </div>
+        <div class="controls-row" style="margin-bottom: 0;">
+            <button class="action-btn stop" onclick="closeModal()">Cancel</button>
+            <button class="action-btn" onclick="submitModalTrade()">Execute Trade ➔</button>
+        </div>
+    </div>
+</div>
+
+<!-- JSON IMPORT MODAL -->
+<div id="importModal" class="modal">
+    <div class="modal-content">
+        <h2 class="modal-title">📥 Import Wallet JSON State</h2>
+        <div class="modal-subtitle">Paste your wallet JSON string below:</div>
+        <textarea id="importJsonText" rows="10" placeholder="Paste JSON here..."></textarea>
+        <div class="controls-row" style="margin-top: 15px; margin-bottom: 0;">
+            <button class="action-btn stop" onclick="closeImportModal()">Cancel</button>
+            <button class="action-btn" onclick="submitImportJson()">Import State ➔</button>
+        </div>
+    </div>
+</div>
+
+<script src="/js/common.js"></script>
+<script src="/js/app.js"></script>
+</body>
+</html>
