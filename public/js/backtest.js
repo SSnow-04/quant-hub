@@ -133,7 +133,7 @@ let lastHistoricalScan = null;
                 </td>
                 <td style="font-weight: bold; color: ${s.signalColor};">${s.finalSignal}<span class="sub-text">Regime: ${s.regime?.label || 'N/A'} · ADX ${s.adxValue ?? ''} · RVOL ${s.relativeVolume ?? ''}</span>${(s.rejectionReasons || []).length ? `<span class="sub-text" style="color:var(--warning);">${s.rejectionReasons.slice(0,2).join(' · ')}</span>` : ''}</td>
                 <td style="font-size: 12px; font-weight: bold; line-height: 1.5;">
-                    <span class="negative">SL (1.5x ATR): $${formatPrice(s.stopPrice)} (-${s.suggestedSL}%)</span><br>
+                    <span class="negative">SL (2.5x ATR): $${formatPrice(s.stopPrice)} (-${s.suggestedSL}%)</span><br>
                     <span class="positive">TP1: $${formatPrice(s.tp1Price)} (+${s.tp1}%)</span><br>
                     <span class="positive">TP2: $${formatPrice(s.tp2Price)} (+${s.tp2}%)</span><br>
                     <span class="positive">TP3: $${formatPrice(s.tp3Price)} (+${s.tp3}%)</span>
@@ -249,6 +249,39 @@ let lastHistoricalScan = null;
         downloadTextFile(filename, JSON.stringify(lastBatchExport, null, 2), 'application/json;charset=utf-8');
     }
 
+    function updateCycleMonitor(job) {
+        const badge = document.getElementById('cycleStateBadge');
+        const info = document.getElementById('cycleCurrentInfo');
+        const log = document.getElementById('cycleEventLog');
+        const state = String(job.cycleState || job.status || 'READY').toUpperCase();
+        if (badge) badge.innerText = state.replaceAll('_', ' ');
+
+        const ids = ['cycleStepScan','cycleStepBuy','cycleStepHold','cycleStepSell','cycleStepRepeat'];
+        ids.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) { el.style.borderColor = 'var(--border)'; el.style.boxShadow = 'none'; el.style.background = 'transparent'; }
+        });
+        const activeId = state === 'SCANNING' ? 'cycleStepScan'
+            : state === 'ENTERED' ? 'cycleStepBuy'
+            : (state === 'HOLDING' || state === 'WAITING_FOR_SELL') ? 'cycleStepHold'
+            : state === 'EXIT' ? 'cycleStepSell'
+            : state === 'REPEAT' ? 'cycleStepRepeat' : null;
+        const activeEl = activeId ? document.getElementById(activeId) : null;
+        if (activeEl) { activeEl.style.borderColor = 'var(--success)'; activeEl.style.boxShadow = '0 0 0 1px var(--success)'; activeEl.style.background = 'rgba(34,197,94,.08)'; }
+
+        const entry = job.currentEntry;
+        const candle = job.currentCandleTime ? new Date(job.currentCandleTime).toLocaleString() : '-';
+        if (info) {
+            info.innerHTML = `<strong>Coin:</strong> ${job.currentCoin || '-'} · <strong>Candle:</strong> ${candle}`
+                + (entry ? `<br><strong>OPEN DEAL:</strong> ${entry.entryReason} @ ${Number(entry.entryPrice).toFixed(8)} · TP ${Number(entry.tp).toFixed(8)} · SL ${Number(entry.sl).toFixed(8)}<br><span style="color:var(--success);font-weight:700;">Waiting for confirmed SELL signal / TP / SL. Neutral candles do NOT automatically sell.</span>`
+                    : `<br><span style="color:var(--text-muted);">No open deal. Scanning forward candle-by-candle until BUY / STRONG BUY appears.</span>`);
+        }
+        if (log) {
+            const events = Array.isArray(job.recentEvents) ? job.recentEvents : [];
+            log.innerHTML = events.length ? events.slice().reverse().map(e => `<div style="margin-bottom:4px;"><span style="color:var(--text-muted);">${e.candleTime ? new Date(e.candleTime).toLocaleString() : ''}</span> · ${e.label}</div>`).join('') : 'No BUY/SELL events yet.';
+        }
+    }
+
     function updateResearchProgress(job) {
         const panel = document.getElementById('researchProgressPanel');
         const text = document.getElementById('researchProgressText');
@@ -258,6 +291,7 @@ let lastHistoricalScan = null;
         const folder = document.getElementById('researchOutputFolder');
         const zipBtn = document.getElementById('downloadResearchZipBtn');
         if (panel) panel.style.display = 'block';
+        updateCycleMonitor(job);
         const total = Number(job.totalCoins || 0);
         const done = Number(job.completedCoins || 0);
         const pct = total ? Math.min(100, (done / total) * 100) : 0;
@@ -318,38 +352,17 @@ let lastHistoricalScan = null;
         const strategyProfile = document.getElementById('strategyProfile')?.value || 'TIMEFRAME_EDGE_SPOT';
         const scanLimit = document.getElementById('histScanLimit')?.value || 'all';
         const spotOnlyResearch = Boolean(document.getElementById('spotOnlyCheck')?.checked);
-        let selectedSymbols = null;
+        // V5.7: the interval-start table is optional/informational. Research does
+        // NOT require a start-of-interval BUY. Every selected coin is scanned
+        // candle-by-candle across the full interval.
+        const selectedSymbols = [];
+        const body = document.getElementById('screenerBody');
 
-        if (spotOnlyResearch) {
-            const scanMatches = lastHistoricalScan
-                && lastHistoricalScan.startTimestamp === startTimestamp
-                && lastHistoricalScan.timeframe === timeframe
-                && String(lastHistoricalScan.scanLimit) === String(scanLimit)
-                && lastHistoricalScan.strategyProfile === strategyProfile;
-
-            if (!scanMatches) {
-                alert('❌ SPOT MODE is checked. First click “Scan Market at Interval Start” with the current start date, timeframe, strategy, and universe. The sequential run will then use only those BUY / STRONG BUY coins.');
-                return;
-            }
-
-            selectedSymbols = historicalDataCache
-                .filter(s => String(s.finalSignal || '').includes('BUY'))
-                .map(s => s.pair);
-
-            if (selectedSymbols.length === 0) {
-                alert('❌ SPOT MODE is checked, but the interval-start scan found no BUY / STRONG BUY coins. Uncheck SPOT MODE to research the full selected universe, or choose another start point.');
-                return;
-            }
-        }
-
-        const summaryPanel = document.getElementById('batchSummaryPanel');
-        const body = document.getElementById('batchResultsBody');
-        summaryPanel.style.display = 'block';
-        summaryPanel.scrollIntoView({ behavior: 'smooth' });
-        body.innerHTML = `<tr><td colspan="11" style="text-align:center;color:var(--text-muted);">Creating sequential research job. The server will process ONE coin at a time and save its CSV before starting the next coin. If SPOT MODE is checked, only BUY / STRONG BUY coins from the current interval-start scan are queued.</td></tr>`;
+        if (body) body.innerHTML = `<tr><td colspan="11" style="text-align:center;color:var(--text-muted);">Creating full-interval signal-cycle research job. For each coin: scan forward until BUY/STRONG BUY → enter at the next candle open → keep scanning while in the deal → exit on a strategy exit/thesis-break signal or TP/SL safety exit → resume scanning from the next candle → repeat until the interval ends.</td></tr>`;
         document.getElementById('downloadResearchZipBtn').style.display = 'none';
         document.getElementById('researchProgressPanel').style.display = 'block';
         document.getElementById('researchProgressText').innerText = 'Creating job...';
+        updateCycleMonitor({ status:'QUEUED', cycleState:'SCANNING', currentCoin:'Preparing universe...', currentCandleTime:null, recentEvents:[] });
 
         try {
             const res = await fetch('/api/research-jobs', {

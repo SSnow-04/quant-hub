@@ -17,8 +17,127 @@ app.use(express.json({ limit: '2mb' }));
 app.use(express.static('public'));
 app.get('/backtest.html', (_, res) => res.sendFile(path.join(__dirname, 'public', 'backtest.html')));
 app.get('/backtest', (_, res) => res.sendFile(path.join(__dirname, 'public', 'backtest.html')));
+app.get('/api/kronos/status', async (_, res) => {
+  if (!KRONOS_ENABLED) return res.json({ enabled:false, available:false });
+  try {
+    const r = await fetchWithTimeout(`${KRONOS_URL}/health`, {}, 2500);
+    const data = await r.json();
+    res.json({ enabled:true, ...data, url:KRONOS_URL });
+  } catch (e) { res.json({ enabled:true, available:false, error:e.message, url:KRONOS_URL }); }
+});
 
 const LIVE_EXCHANGE_TIMEOUT_MS = Number(process.env.LIVE_EXCHANGE_TIMEOUT_MS || 20_000);
+
+// V5.16 Kronos forecast overlay. Optional: Quant Hub still works if the Python service is offline.
+const KRONOS_ENABLED = String(process.env.KRONOS_ENABLED || 'true').toLowerCase() !== 'false';
+const KRONOS_URL = String(process.env.KRONOS_URL || 'http://127.0.0.1:8765').replace(/\/$/, '');
+const KRONOS_TIMEOUT_MS = Math.max(500, Number(process.env.KRONOS_TIMEOUT_MS || 12_000));
+const KRONOS_CACHE_TTL_MS = Math.max(10_000, Number(process.env.KRONOS_CACHE_TTL_MS || 180_000));
+const kronosCache = new Map();
+let kronosSerial = Promise.resolve();
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = KRONOS_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try { return await fetch(url, { ...options, signal: controller.signal }); }
+  finally { clearTimeout(timer); }
+}
+
+async function getKronosForecast(symbol, tf, candles) {
+  if (!KRONOS_ENABLED || ['1m','3m'].includes(tf)) return null;
+  const lastTs = candles?.[candles.length - 1]?.[0] || 0;
+  const key = `${symbol}|${tf}|${lastTs}`;
+  const cached = kronosCache.get(key);
+  if (cached && Date.now() - cached.ts < KRONOS_CACHE_TTL_MS) return cached.data;
+  // Keep inference serialized by default: one GPU/CPU model should not be hammered by the live scanner.
+  const job = async () => {
+    try {
+      const res = await fetchWithTimeout(`${KRONOS_URL}/forecast`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ symbol, timeframe: tf, candles: candles.slice(-192) })
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (!data?.ok) return null;
+      kronosCache.set(key, { ts: Date.now(), data });
+      return data;
+    } catch { return null; }
+  };
+  const run = kronosSerial.then(job, job);
+  kronosSerial = run.catch(() => null);
+  return run;
+}
+
+function applyKronosOverlay(analysis, forecast, tf) {
+  if (!analysis || !forecast?.ok) return analysis;
+  const out = { ...analysis, snapshot: { ...(analysis.snapshot || {}) } };
+  const kScore = Math.max(-1.75, Math.min(1.75, Number(forecast.score || 0)));
+  const kConf = Math.max(0, Math.min(1, Number(forecast.confidence || 0)));
+  const technicalEvidence = [
+    String(analysis.emaStr || '').includes('Uptrend'),
+    String(analysis.macroEmaStr || '').includes('Bullish'),
+    String(analysis.macdStr || '').includes('Bullish'),
+    String(analysis.vwapStr || '').includes('Above'),
+    /bullish structure|bos \(bullish\)/i.test(String(analysis.smcStr || '')),
+    String(analysis.utBotStr || '').includes('Long'),
+    String(analysis.ichimokuStr || '').includes('Bullish')
+  ].filter(Boolean).length;
+  const base = Number(analysis.edgeQualityScore || analysis.consensusScore || 0);
+  const composite = base + kScore * (0.65 + 0.35 * kConf);
+  const originalSignal = String(analysis.finalSignal || '');
+  const isAvoid = originalSignal.includes('AVOID');
+  const higherTf = ['1h','2h','4h','6h','8h','12h','1d','3d','1w'].includes(tf);
+
+  out.kronos = { ...forecast, technicalEvidence, baseScore: Number(base.toFixed(2)), compositeScore: Number(composite.toFixed(2)) };
+  out.kronosLabel = forecast.label;
+  out.kronosScore = Number(kScore.toFixed(2));
+  out.kronosForecastReturnPct = Number(Number(forecast.forecastReturnPct || 0).toFixed(2));
+  out.kronosConfidence = Number(kConf.toFixed(2));
+
+  if (!isAvoid && higherTf) {
+    if (forecast.label === 'BULLISH' && technicalEvidence >= 4 && composite >= 4.8) {
+      if (technicalEvidence >= 6 && composite >= 6.4 && !originalSignal.includes('EXTENDED')) {
+        out.finalSignal = 'STRONG BUY + KRONOS 🚀'; out.signalColor = '#10b981';
+      } else if (!originalSignal.includes('BUY')) {
+        out.finalSignal = originalSignal.includes('EXTENDED') ? 'TREND WATCH + KRONOS 🟡' : 'TREND BUY + KRONOS 🟢';
+        out.signalColor = originalSignal.includes('EXTENDED') ? '#f59e0b' : '#34d399';
+      }
+    } else if (forecast.label === 'BEARISH' && kConf >= 0.45 && originalSignal.includes('BUY')) {
+      out.finalSignal = 'WATCH — KRONOS DISAGREES 🟡'; out.signalColor = '#f59e0b';
+    }
+  } else if (!isAvoid && ['5m','15m'].includes(tf)) {
+    // Small timeframes: Kronos may strengthen an existing trigger/watch, but never create a trade from nothing.
+    if (forecast.label === 'BULLISH' && technicalEvidence >= 4 && (originalSignal.includes('WATCH') || originalSignal.includes('BUY'))) {
+      if (originalSignal.includes('BUY')) out.finalSignal = 'BUY + KRONOS 🟢';
+      else if (composite >= 5.25) out.finalSignal = 'EARLY BUY + KRONOS 🟢';
+      out.signalColor = out.finalSignal.includes('BUY') ? '#34d399' : out.signalColor;
+    }
+  } else if (!isAvoid && tf === '30m') {
+    // V5.16: Kronos is supporting evidence on 30m, not a fragile veto. The technical
+    // engine now has both Recovery and Trend-Continuation entry paths.
+    if (forecast.label === 'BULLISH' && technicalEvidence >= 4) {
+      if (originalSignal.includes('BUY')) {
+        out.finalSignal = originalSignal.replace(' 🚀','').replace(' 🟢','') + ' + KRONOS 🟢';
+        out.signalColor = '#34d399';
+      } else if ((originalSignal.includes('WATCH') || originalSignal.includes('CASH')) && composite >= 4.15) {
+        out.finalSignal = 'EARLY TREND BUY + KRONOS 🟢';
+        out.signalColor = '#34d399';
+      }
+    }
+    // Only a materially bearish, high-confidence forecast can downgrade a real technical BUY.
+    if (originalSignal.includes('BUY') && forecast.label === 'BEARISH' && kConf >= 0.75 && Number(forecast.forecastReturnPct || 0) <= -1.5) {
+      out.finalSignal = 'WATCH — STRONG KRONOS DISAGREEMENT 🟡';
+      out.signalColor = '#f59e0b';
+    }
+  }
+  out.isBuySignal = String(out.finalSignal).includes('BUY');
+  out.isStrongBuy = String(out.finalSignal).includes('STRONG BUY');
+  out.snapshot.consensus = out.finalSignal;
+  out.snapshot.kronos = forecast.label;
+  out.snapshot.kronosScore = out.kronosScore;
+  out.snapshot.kronosForecastReturnPct = out.kronosForecastReturnPct;
+  return out;
+}
 const exchanges = {
   binance: new ccxt.pro.binance({ enableRateLimit: true, timeout: LIVE_EXCHANGE_TIMEOUT_MS }),
   gateio: new ccxt.pro.gate({ enableRateLimit: true, timeout: LIVE_EXCHANGE_TIMEOUT_MS }),
@@ -317,8 +436,246 @@ if (fs.existsSync(STATE_FILE)) {
 }
 
 function saveWalletState() {
-  try { fs.writeFileSync(STATE_FILE, JSON.stringify(persistentWalletState, null, 2)); }
-  catch (e) { console.warn('Wallet state could not be saved:', e.message); }
+  try {
+    const tmp = `${STATE_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(persistentWalletState, null, 2));
+    fs.renameSync(tmp, STATE_FILE);
+  } catch (e) { console.warn('Wallet state could not be saved:', e.message); }
+}
+
+const POSITION_MONITOR_INTERVAL_MS = Math.max(3_000, Number(process.env.POSITION_MONITOR_INTERVAL_MS || 8_000));
+let positionMonitorRunning = false;
+let positionMonitorLastRunAt = 0;
+let positionMonitorLastError = null;
+
+function adaptiveHoldMs(timeframe = '5m') {
+  const tfMs = parseTimeframeMs(timeframe || '5m');
+  const candles = tfMs <= 300_000 ? 48 : tfMs <= 900_000 ? 32 : tfMs <= 3_600_000 ? 24 : 12;
+  return candles * tfMs;
+}
+
+function migratePersistentPositionState() {
+  const now = Date.now();
+  for (const walletName of ['manualWallet', 'autoWallet']) {
+    const wallet = persistentWalletState[walletName];
+    if (!wallet || !Array.isArray(wallet.openPositions)) continue;
+    for (const pos of wallet.openPositions) {
+      const entryTs = Number(pos.entryTimestamp) || now;
+      pos.entryTimestamp = entryTs;
+      pos.lastCheckedAt = Number(pos.lastCheckedAt) || entryTs;
+      pos.currentSellPrice = Number(pos.currentSellPrice) || Number(pos.buyAsk) || 0;
+      // V5.5: targets are immutable execution-state fields once the trade is open.
+      pos.targetHigh = Number(pos.targetHigh);
+      pos.targetLow = Number(pos.targetLow);
+      pos.executionManagedBy = 'server';
+    }
+  }
+}
+
+function serverClosePosition(walletName, index, exitPrice, reason, closedAt = Date.now()) {
+  const wallet = persistentWalletState[walletName];
+  if (!wallet || !wallet.openPositions?.[index]) return null;
+  const pos = wallet.openPositions[index];
+  const px = Number(exitPrice);
+  if (!(px > 0)) return null;
+
+  const tokensBought = Number(pos.tokensBought || 0);
+  const tradeAmount = Number(pos.tradeAmount || 0);
+  const grossExitUSD = tokensBought * px;
+  const sellFeeUSD = grossExitUSD * TAKER_FEE_RATE;
+  const netExitUSD = grossExitUSD - sellFeeUSD;
+  wallet.cashBalance = Number(wallet.cashBalance || 0) + netExitUSD;
+
+  const totalFeesUSD = Number(pos.buyFeeUSD || 0) + sellFeeUSD;
+  const netProfitUSD = netExitUSD - tradeAmount;
+  const buyEx = String(pos.buyEx || 'binance').toUpperCase();
+  const sellEx = String(pos.sellEx || pos.buyEx || 'binance').toUpperCase();
+  const closedDate = new Date(closedAt);
+
+  const record = {
+    id: pos.id,
+    entryTime: pos.entryTime || pos.time,
+    entryTimestamp: Number(pos.entryTimestamp) || null,
+    closedTime: closedDate.toLocaleTimeString(),
+    closedTimestamp: closedAt,
+    timeframe: pos.timeframe || '1h',
+    pair: pos.pair,
+    inSignal: pos.triggerSource || 'Manual Entry',
+    outSignal: reason,
+    indicatorSnapshot: pos.indicatorSnapshot || {},
+    route: `${buyEx} ➔ ${sellEx}`,
+    tradeAmount,
+    buyAsk: Number(pos.buyAsk || 0),
+    exitPrice: px,
+    buyFeeUSD: Number(pos.buyFeeUSD || 0),
+    sellFeeUSD,
+    totalFeesUSD,
+    netProfitUSD,
+    dcaCount: Number(pos.dcaCount || 1),
+    newBalance: wallet.cashBalance,
+    type: pos.type || (walletName === 'autoWallet' ? 'Auto' : 'Manual'),
+    executionManagedBy: 'server'
+  };
+
+  wallet.closedHistory = Array.isArray(wallet.closedHistory) ? wallet.closedHistory : [];
+  wallet.closedHistory.unshift(record);
+  wallet.openPositions.splice(index, 1);
+  saveWalletState();
+  io.emit('load-wallet-state', persistentWalletState);
+  console.log(`[Position Manager] ${pos.pair} closed @ ${px} — ${reason}`);
+  return record;
+}
+
+async function fetchOpenPositionQuotes() {
+  const grouped = new Map();
+  for (const walletName of ['manualWallet', 'autoWallet']) {
+    const wallet = persistentWalletState[walletName];
+    for (const pos of wallet?.openPositions || []) {
+      const venue = String(pos.sellEx || pos.buyEx || 'binance').toLowerCase();
+      const actualVenue = exchanges[venue] ? venue : 'binance';
+      if (!grouped.has(actualVenue)) grouped.set(actualVenue, new Set());
+      grouped.get(actualVenue).add(pos.pair);
+    }
+  }
+
+  const out = {};
+  await Promise.all([...grouped.entries()].map(async ([venue, symbolSet]) => {
+    const ex = exchanges[venue];
+    const symbols = [...symbolSet];
+    out[venue] = {};
+    try {
+      let rows = {};
+      if (ex.has?.fetchTickers && symbols.length > 1) {
+        try { rows = await withTimeout(ex.fetchTickers(symbols), 12_000, `${venue} position tickers`); }
+        catch { rows = {}; }
+      }
+      for (const symbol of symbols) {
+        let t = rows?.[symbol];
+        if (!t) {
+          try { t = await withTimeout(ex.fetchTicker(symbol), 10_000, `${venue} ${symbol} position ticker`); }
+          catch (e) { continue; }
+        }
+        const bid = Number(t?.bid || t?.last || t?.close);
+        const ask = Number(t?.ask || t?.last || t?.close);
+        if (bid > 0 || ask > 0) out[venue][symbol] = { bid: bid || ask, ask: ask || bid, timestamp: Number(t?.timestamp) || Date.now() };
+      }
+    } catch (e) {
+      console.warn(`[Position Manager] quote refresh failed on ${venue}: ${e.message}`);
+    }
+  }));
+  return out;
+}
+
+async function reconcilePositionOffline(walletName, posIndex) {
+  const wallet = persistentWalletState[walletName];
+  const pos = wallet?.openPositions?.[posIndex];
+  if (!pos) return false;
+  const now = Date.now();
+  const since = Math.max(Number(pos.entryTimestamp || 0), Number(pos.lastCheckedAt || pos.entryTimestamp || 0));
+  if (!since || now - since < 30_000) return false;
+
+  const tf = normalizeTimeframe(pos.timeframe || '30m');
+  const tfMs = parseTimeframeMs(tf);
+  const exchangeName = exchanges[String(pos.sellEx || '').toLowerCase()] ? String(pos.sellEx).toLowerCase() : 'binance';
+  const ex = exchanges[exchangeName];
+  const stop = Number(pos.targetLow);
+  const tp = Number(pos.targetHigh);
+  if (!(stop > 0) || !(tp > 0)) return false;
+
+  try {
+    // No warmup is needed: this is execution reconciliation, not signal analysis.
+    const candles = await fetchHistoricalRange(ex, pos.pair, tf, Math.max(0, since - tfMs), now, 1);
+    for (const candle of candles) {
+      const [ts, open, high, low, close] = candle.map(Number);
+      if (ts + tfMs < since) continue;
+      if (ts > now) break;
+
+      // Conservative ambiguity rule: when both TP and SL are inside the same offline candle,
+      // assume the stop was hit first rather than inventing an optimistic sequence.
+      if (low <= stop) {
+        serverClosePosition(walletName, posIndex, stop, '🛑 STOP LOSS HIT (OFFLINE RECONCILIATION)', Math.max(since, ts));
+        return true;
+      }
+      if (high >= tp) {
+        serverClosePosition(walletName, posIndex, tp, '🎯 LIMIT TAKE PROFIT HIT (OFFLINE RECONCILIATION)', Math.max(since, ts));
+        return true;
+      }
+
+      const maxHoldAt = Number(pos.entryTimestamp || now) + adaptiveHoldMs(tf);
+      if (maxHoldAt >= ts && maxHoldAt < ts + tfMs && maxHoldAt <= now) {
+        serverClosePosition(walletName, posIndex, close > 0 ? close : Number(pos.currentSellPrice || pos.buyAsk), '⏰ ADAPTIVE MAX HOLD EXIT (OFFLINE RECONCILIATION)', maxHoldAt);
+        return true;
+      }
+    }
+  } catch (e) {
+    console.warn(`[Position Manager] offline reconciliation failed for ${pos.pair}: ${e.message}`);
+  }
+  return false;
+}
+
+async function reconcileAllOpenPositionsOnStartup() {
+  migratePersistentPositionState();
+  saveWalletState();
+  for (const walletName of ['manualWallet', 'autoWallet']) {
+    // Work backwards because reconciliation may remove positions.
+    for (let i = (persistentWalletState[walletName]?.openPositions?.length || 0) - 1; i >= 0; i--) {
+      await reconcilePositionOffline(walletName, i);
+    }
+  }
+  saveWalletState();
+}
+
+async function monitorOpenPositions() {
+  if (positionMonitorRunning) return;
+  const totalOpen = ['manualWallet', 'autoWallet'].reduce((n, w) => n + (persistentWalletState[w]?.openPositions?.length || 0), 0);
+  if (!totalOpen) { positionMonitorLastRunAt = Date.now(); return; }
+  positionMonitorRunning = true;
+  try {
+    const quotes = await fetchOpenPositionQuotes();
+    const now = Date.now();
+    let changed = false;
+    for (const walletName of ['manualWallet', 'autoWallet']) {
+      const wallet = persistentWalletState[walletName];
+      for (let i = (wallet?.openPositions?.length || 0) - 1; i >= 0; i--) {
+        const pos = wallet.openPositions[i];
+        const venue = exchanges[String(pos.sellEx || '').toLowerCase()] ? String(pos.sellEx).toLowerCase() : 'binance';
+        const q = quotes?.[venue]?.[pos.pair] || quotes?.binance?.[pos.pair];
+        if (!q) continue;
+        const currentBid = Number(q.bid || q.ask);
+        if (!(currentBid > 0)) continue;
+        pos.currentSellPrice = currentBid;
+        pos.lastCheckedAt = now;
+        pos.executionManagedBy = 'server';
+        changed = true;
+
+        const stop = Number(pos.targetLow);
+        const tp = Number(pos.targetHigh);
+        if (stop > 0 && currentBid <= stop) {
+          serverClosePosition(walletName, i, stop, '🛑 STOP LOSS HIT');
+          continue;
+        }
+        if (tp > 0 && currentBid >= tp) {
+          serverClosePosition(walletName, i, tp, '🎯 LIMIT TAKE PROFIT HIT');
+          continue;
+        }
+        if (now - Number(pos.entryTimestamp || now) >= adaptiveHoldMs(pos.timeframe || '5m')) {
+          serverClosePosition(walletName, i, currentBid, '⏰ ADAPTIVE MAX HOLD EXIT');
+          continue;
+        }
+      }
+    }
+    if (changed) {
+      saveWalletState();
+      io.emit('load-wallet-state', persistentWalletState);
+    }
+    positionMonitorLastRunAt = Date.now();
+    positionMonitorLastError = null;
+  } catch (e) {
+    positionMonitorLastError = e.message;
+    console.warn(`[Position Manager] ${e.message}`);
+  } finally {
+    positionMonitorRunning = false;
+  }
 }
 
 
@@ -385,8 +742,74 @@ function targetsAtEntry(entryPrice, analysis, targetLevel = 'TP2') {
   const tp1 = entryPrice + Math.max(1.0 * atr, entryPrice * feeBufferPct);
   const tp2 = entryPrice + Math.max(2.0 * atr, entryPrice * (feeBufferPct + 0.002));
   const tp3 = entryPrice + Math.max(3.5 * atr, entryPrice * (feeBufferPct + 0.005));
-  const stop = entryPrice - 1.5 * atr;
+  const stop = entryPrice - 2.5 * atr;
   return { stop, tp1, tp2, tp3, chosen: targetLevel === 'TP1' ? tp1 : targetLevel === 'TP3' ? tp3 : tp2 };
+}
+
+
+const SL_STUDY_ATR_MULTIPLIERS = [1.5, 2.0, 2.5, 3.0];
+
+function simulateProtectiveSlVariant({ ohlcv, entryIndex, entryPrice, atr, targetPrice, maxHoldMs, endMs, capital, slAtr }) {
+  const stopPrice = entryPrice - slAtr * atr;
+  const buyFeeUSD = capital * TAKER_FEE_RATE;
+  const tokens = (capital - buyFeeUSD) / entryPrice;
+  let minPrice = entryPrice;
+  let maxPrice = entryPrice;
+  let exitPrice = null;
+  let exitReason = 'END_INTERVAL';
+  let exitTimestamp = ohlcv[Math.min(entryIndex, ohlcv.length - 1)]?.[0] || endMs;
+
+  for (let j = entryIndex; j < ohlcv.length; j++) {
+    const [ts, open, high, low, close] = ohlcv[j];
+    if (ts > endMs) break;
+    minPrice = Math.min(minPrice, Number(low));
+    maxPrice = Math.max(maxPrice, Number(high));
+    const hitStop = Number(low) <= stopPrice;
+    const hitTp = Number(high) >= targetPrice;
+    if (hitStop) {
+      exitPrice = stopPrice;
+      exitReason = hitTp ? 'SL_FIRST_SAME_CANDLE' : 'SL';
+      exitTimestamp = ts;
+      break;
+    }
+    if (hitTp) {
+      exitPrice = targetPrice;
+      exitReason = 'TP';
+      exitTimestamp = ts;
+      break;
+    }
+    if (ts - (ohlcv[entryIndex]?.[0] || ts) >= maxHoldMs) {
+      exitPrice = Number(close);
+      exitReason = 'MAX_HOLD';
+      exitTimestamp = ts;
+      break;
+    }
+    exitPrice = Number(close);
+    exitTimestamp = ts;
+  }
+
+  if (!(exitPrice > 0)) exitPrice = entryPrice;
+  const grossExitUSD = tokens * exitPrice;
+  const sellFeeUSD = grossExitUSD * TAKER_FEE_RATE;
+  const netExitUSD = grossExitUSD - sellFeeUSD;
+  const netPnlUSD = netExitUSD - capital;
+  const totalFeesUSD = buyFeeUSD + sellFeeUSD;
+  return {
+    sl_atr: slAtr,
+    stop_price: stopPrice,
+    exit_price: exitPrice,
+    exit_reason: exitReason,
+    exit_time_ms: exitTimestamp,
+    hold_hours: Math.max(0, (exitTimestamp - (ohlcv[entryIndex]?.[0] || exitTimestamp)) / 3600000),
+    min_price: minPrice,
+    max_price: maxPrice,
+    mae_pct: entryPrice > 0 ? ((entryPrice - minPrice) / entryPrice) * 100 : 0,
+    mfe_pct: entryPrice > 0 ? ((maxPrice - entryPrice) / entryPrice) * 100 : 0,
+    fees_usd: totalFeesUSD,
+    net_pnl_usd: netPnlUSD,
+    return_pct: capital > 0 ? (netPnlUSD / capital) * 100 : 0,
+    won: netPnlUSD > 0
+  };
 }
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
@@ -480,7 +903,45 @@ async function fetchBenchmarkRange(tf, startMs, endMs) {
   return { timeframe: regimeTf, candles };
 }
 
-async function runBacktest({ symbolPair, tf, startMs, endMs = Date.now(), initialCapital, targetLevel = 'AUTO', forceManualEntry = false, strategyProfile = STRATEGY_PROFILES.TIMEFRAME_EDGE_SPOT, benchmarkCandles = [], benchmarkTimeframe = null }) {
+function deriveResearchSellSignal(analysis) {
+  if (!analysis) return { sell: false, bearishStructure: false, ema50BreakCandidate: false, warning: false, reason: '' };
+  const snap = analysis.snapshot || {};
+  const pf = snap.pullbackFeatures || analysis.pullbackFeatures || {};
+  const smc = String(snap.smc || '');
+  const macdBearish = String(snap.macd || '').toLowerCase().includes('bearish');
+  const price = Number(analysis.price || 0);
+  const ema21 = Number(pf.ema21 || 0);
+  const ema50 = Number(pf.ema50 || 0);
+  const ema21SlopePct3 = Number(pf.ema21SlopePct3 || 0);
+  const rsiDelta1 = Number(pf.rsiDelta1 || 0);
+
+  // V5.16: keep exits simple while timeframe-specific entries are routed by TIMEFRAME_EDGE_SPOT.
+  // CHOCH and EMA21 momentum rollover are information/warnings only.
+  // Bearish Structure remains the primary strategy sell. EMA50 failure must
+  // persist and be confirmed by a damaged EMA trend before it can sell.
+  const choch = /choch/i.test(smc);
+  const bullishStructure = /bullish structure|bos \(bullish\)/i.test(smc);
+  const bearishStructure = /bearish structure/i.test(smc) && !choch;
+  const belowEma50 = price > 0 && ema50 > 0 && price < ema50;
+  const emaTrendDamaged = ema21 > 0 && ema50 > 0 && ema21 < ema50 && ema21SlopePct3 <= 0;
+  const ema50BreakCandidate = belowEma50 && emaTrendDamaged && !bullishStructure;
+
+  if (bearishStructure) {
+    return { sell: true, bearishStructure: true, ema50BreakCandidate, warning: false, reason: `Bearish Structure confirmed (${smc || 'bearish'})` };
+  }
+
+  if (ema50BreakCandidate) {
+    return { sell: false, bearishStructure: false, ema50BreakCandidate: true, warning: true, reason: 'EMA50 trend-break candidate — awaiting 3 closed-candle confirmation' };
+  }
+
+  if (choch || (price > 0 && ema21 > 0 && price < ema21 && macdBearish && rsiDelta1 < 0)) {
+    return { sell: false, bearishStructure: false, ema50BreakCandidate: false, warning: true, reason: 'Structure/momentum warning only — HOLD' };
+  }
+
+  return { sell: false, bearishStructure: false, ema50BreakCandidate: false, warning: false, reason: '' };
+}
+
+async function runBacktest({ symbolPair, tf, startMs, endMs = Date.now(), initialCapital, targetLevel = 'AUTO', forceManualEntry = false, strategyProfile = STRATEGY_PROFILES.TIMEFRAME_EDGE_SPOT, benchmarkCandles = [], benchmarkTimeframe = null, onProgress = null }) {
   if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
     throw new Error('Historical end time must be after the start time.');
   }
@@ -492,16 +953,22 @@ async function runBacktest({ symbolPair, tf, startMs, endMs = Date.now(), initia
 
   const maxHoldMs = maxHoldMsForTimeframe(tf);
   const closedDeals = [];
+  const slStudyRows = [];
   const regimeCache = new Map();
   let currentCash = initialCapital;
   let active = null;
   let cooldownUntilIndex = -1;
   let firstEntryDone = false;
+  let requireFreshSetupReset = false;
 
   for (let i = startIndex; i < ohlcv.length; i++) {
     const candle = ohlcv[i];
     const [candleTimeMs, openPrice, highPrice, lowPrice, closePrice] = candle;
     if (candleTimeMs > endMs) break;
+    if (onProgress && (i === startIndex || i % 8 === 0)) {
+      onProgress({ type: active ? 'HOLDING' : 'SCANNING', candleTimeMs, symbol: symbolPair, candleIndex: i, totalCandles: ohlcv.length, entryPrice: active?.entryPrice || null, signal: active ? active.inSignal : null });
+      await new Promise(resolve => setImmediate(resolve));
+    }
 
     if (active) {
       const durationMs = candleTimeMs - active.entryTimestamp;
@@ -509,12 +976,38 @@ async function runBacktest({ symbolPair, tf, startMs, endMs = Date.now(), initia
         ? regimeAtTimestamp(benchmarkCandles, candleTimeMs, regimeCache, benchmarkTimeframe || regimeTimeframeForTrade(tf))
         : { label: 'BASELINE', allowLong: true };
       const regimeExit = strategyProfile === STRATEGY_PROFILES.V4_REGIME_SPOT && ['WEAK_BEAR', 'BEAR'].includes(regimeNow.label);
+
+      // V5.7 signal-cycle research: while a position is open, evaluate the strategy
+      // again using ONLY candles that were fully closed before this candle. This is
+      // the same no-look-ahead timing used for entries. A confirmed AVOID signal
+      // is an explicit thesis-break exit at this candle's open. Two consecutive
+      // neutral CASH/NO TRADE readings also count as loss of entry support.
+      let liveAnalysis = null;
+      if (i >= 60) {
+        liveAnalysis = analyzeMarket(ohlcv.slice(0, i), { minCandles: 60, timeframe: tf, profile: strategyProfile, regime: regimeNow });
+      }
+      const signalText = String(liveAnalysis?.finalSignal || liveAnalysis?.snapshot?.consensus || '');
+      const stillBuy = Boolean(liveAnalysis?.isBuySignal);
+      const sellSignal = deriveResearchSellSignal(liveAnalysis);
+
+      // V5.16: EMA50/CHOCH weakness remains diagnostic only. The larger research runs
+      // showed that EMA50 exits destroyed expectancy. Only confirmed Bearish Structure
+      // is allowed to trigger a strategy exit; TP/SL/max-hold remain protective exits.
+      if (sellSignal.ema50BreakCandidate) active.ema50BreakCount = (active.ema50BreakCount || 0) + 1;
+      else active.ema50BreakCount = 0;
+
+      const tfMs = parseTimeframeMs(tf);
+      const minSignalHoldMs = tfMs * (active.isStrongBuy ? 3 : 2);
+      const signalExitAllowed = durationMs >= minSignalHoldMs;
+
       const hitStop = lowPrice <= active.targetLow;
       const hitTp = highPrice >= active.targetHigh;
       let exitReason = null, exitPrice = null;
 
-      // Regime is known from fully closed benchmark candles before this candle, so a spot exit can occur at the new candle open.
+      // TP/SL remain immediate. Strategy exits need a minimum hold so one noisy
+      // candle cannot undo a fresh entry. Strong buys receive one extra candle.
       if (regimeExit) { exitReason = `💵 BTC REGIME CASH EXIT (${regimeNow.label})`; exitPrice = Number(openPrice) || Number(closePrice); }
+      else if (sellSignal.sell && signalExitAllowed) { exitReason = `📉 SELL SIGNAL — ${sellSignal.reason}`; exitPrice = Number(openPrice) || Number(closePrice); }
       else {
         active.minPriceExcursion = Math.min(active.minPriceExcursion, lowPrice);
         // Conservative OHLC rule: if both could have happened in the same candle, assume the stop was hit first.
@@ -558,8 +1051,37 @@ async function runBacktest({ symbolPair, tf, startMs, endMs = Date.now(), initia
           holdHours: (durationMs / 3_600_000).toFixed(2)
         });
         currentCash = netExitUSD;
+        for (const slAtr of SL_STUDY_ATR_MULTIPLIERS) {
+          const shadow = simulateProtectiveSlVariant({
+            ohlcv,
+            entryIndex: active.entryIndex,
+            entryPrice: active.entryPrice,
+            atr: active.entryAtr,
+            targetPrice: active.targetHigh,
+            maxHoldMs,
+            endMs,
+            capital: active.costBasis,
+            slAtr
+          });
+          slStudyRows.push({
+            pair: symbolPair,
+            timeframe: tf,
+            strategy_profile: strategyProfile,
+            trade_no: closedDeals.length,
+            entry_time_ms: active.entryTimestamp,
+            entry_signal: active.inSignal,
+            target_level: active.targetLevel,
+            entry_price: active.entryPrice,
+            target_price: active.targetHigh,
+            ...shadow
+          });
+        }
+        if (onProgress) onProgress({ type: 'EXIT', candleTimeMs, symbol: symbolPair, exitReason, exitPrice, pnl: netProfitUSD, nextState: 'SCANNING' });
         active = null;
-        cooldownUntilIndex = i + 3;
+        // V5.16: do not immediately recycle into the same persistent BUY condition.
+        // The strategy must first reset to a non-buy state before a fresh setup can enter.
+        requireFreshSetupReset = true;
+        cooldownUntilIndex = i;
       }
     }
 
@@ -571,6 +1093,11 @@ async function runBacktest({ symbolPair, tf, startMs, endMs = Date.now(), initia
       : { label: 'BASELINE', score: 0, allowLong: true, strongLong: true };
     const analysis = analyzeMarket(ohlcv.slice(0, i), { minCandles: 60, timeframe: tf, profile: strategyProfile, regime });
     if (!analysis) continue;
+
+    if (requireFreshSetupReset) {
+      if (!analysis.isBuySignal) requireFreshSetupReset = false;
+      else continue;
+    }
 
     let entryReason = null;
     if (forceManualEntry && !firstEntryDone && candleTimeMs >= startMs) entryReason = 'Manual Historical Spot Entry';
@@ -584,6 +1111,13 @@ async function runBacktest({ symbolPair, tf, startMs, endMs = Date.now(), initia
     const entryPrice = Number(openPrice) || Number(closePrice);
     const actualTargetLevel = resolveTargetLevel(targetLevel, tf);
     const t = targetsAtEntry(entryPrice, analysis, actualTargetLevel);
+    const targetMovePct = entryPrice > 0 ? (t.chosen - entryPrice) / entryPrice : 0;
+    const roundTripFeePct = 2 * TAKER_FEE_RATE;
+    const minRewardVsFeesPct = roundTripFeePct * 4; // require target move >= 4x estimated round-trip taker fees
+    if (!forceManualEntry && targetMovePct < minRewardVsFeesPct) {
+      if (onProgress) onProgress({ type: 'SKIP', candleTimeMs, symbol: symbolPair, reason: `Fee-aware filter: target ${(targetMovePct*100).toFixed(2)}% < ${(minRewardVsFeesPct*100).toFixed(2)}% minimum` });
+      continue;
+    }
     const buyFeeUSD = currentCash * TAKER_FEE_RATE;
     const effectiveCapital = currentCash - buyFeeUSD;
     const tokens = effectiveCapital / entryPrice;
@@ -600,8 +1134,14 @@ async function runBacktest({ symbolPair, tf, startMs, endMs = Date.now(), initia
       inSignal: entryReason,
       strategyProfile,
       benchmarkTimeframe,
-      snapshot: analysis.snapshot
+      snapshot: analysis.snapshot,
+      isStrongBuy: Boolean(analysis.isStrongBuy),
+      entryIndex: i,
+      entryAtr: Number(analysis?.atr || entryPrice * 0.01),
+      neutralSignalCount: 0,
+      ema50BreakCount: 0
     };
+    if (onProgress) onProgress({ type: 'ENTERED', candleTimeMs, symbol: symbolPair, entryPrice, entryReason, tp: t.chosen, sl: t.stop, nextState: 'WAITING_FOR_SELL' });
   }
 
   // Close any position that is still open at the end of the requested test interval.
@@ -645,6 +1185,31 @@ async function runBacktest({ symbolPair, tf, startMs, endMs = Date.now(), initia
       holdHours: (durationMs / 3_600_000).toFixed(2)
     });
     currentCash = netExitUSD;
+    for (const slAtr of SL_STUDY_ATR_MULTIPLIERS) {
+      const shadow = simulateProtectiveSlVariant({
+        ohlcv,
+        entryIndex: active.entryIndex,
+        entryPrice: active.entryPrice,
+        atr: active.entryAtr,
+        targetPrice: active.targetHigh,
+        maxHoldMs,
+        endMs,
+        capital: active.costBasis,
+        slAtr
+      });
+      slStudyRows.push({
+        pair: symbolPair,
+        timeframe: tf,
+        strategy_profile: strategyProfile,
+        trade_no: closedDeals.length,
+        entry_time_ms: active.entryTimestamp,
+        entry_signal: active.inSignal,
+        target_level: active.targetLevel,
+        entry_price: active.entryPrice,
+        target_price: active.targetHigh,
+        ...shadow
+      });
+    }
     active = null;
   }
 
@@ -661,6 +1226,7 @@ async function runBacktest({ symbolPair, tf, startMs, endMs = Date.now(), initia
     finalBalance: currentCash,
     totalPnl: currentCash - initialCapital,
     closedDeals,
+    slStudyRows,
     hasOpenPosition: false
   };
 }
@@ -708,8 +1274,16 @@ async function getSignalData(timeframe, force = false, strategyProfile = STRATEG
       while (queue.length) {
         const symbol = queue.shift();
         try {
-          const ohlcv = await exchanges.binance.fetchOHLCV(symbol, tf, undefined, 140);
-          const analysis = analyzeMarket(ohlcv, { minCandles: 60, timeframe: tf, profile, regime: liveRegime });
+          const ohlcv = await exchanges.binance.fetchOHLCV(symbol, tf, undefined, 220);
+          let analysis = analyzeMarket(ohlcv, { minCandles: 60, timeframe: tf, profile, regime: liveRegime });
+          if (analysis && profile === STRATEGY_PROFILES.TIMEFRAME_EDGE_SPOT && KRONOS_ENABLED) {
+            const signal = String(analysis.finalSignal || '');
+            const candidateForAi = !signal.includes('AVOID') && (analysis.edgeQualityScore >= 3.25 || signal.includes('BUY') || signal.includes('WATCH') || signal.includes('EXTENDED'));
+            if (candidateForAi) {
+              const forecast = await getKronosForecast(symbol, tf, ohlcv);
+              analysis = applyKronosOverlay(analysis, forecast, tf);
+            }
+          }
           if (analysis) result[symbol] = analysis;
         } catch {}
       }
@@ -852,7 +1426,7 @@ function buildArbitrageOpportunities() {
 }
 
 app.get('/api/all-pairs', (_, res) => res.json({ pairs: allEligiblePairs, venues: pairVenues, count: allEligiblePairs.length }));
-app.get('/api/health', (_, res) => res.json({ success: true, mode: 'V4 Regime Spot', quoteSources: exchangeNames, pairs: allEligiblePairs.length, binanceSignalPairs: binanceSignalPairs.length, arbitrageCandidates: arbitragePairs.length, strictlyVerifiedArbitragePairs: strictlyVerifiedArbitragePairs.length, identityMode: ARB_IDENTITY_MODE, identityRejectedPairs: Object.keys(identityRejectedPairs).length }));
+app.get('/api/health', (_, res) => res.json({ success: true, mode: 'V5.16 Timeframe Router + 2.5 ATR SL + Server Position Manager', quoteSources: exchangeNames, pairs: allEligiblePairs.length, binanceSignalPairs: binanceSignalPairs.length, arbitrageCandidates: arbitragePairs.length, strictlyVerifiedArbitragePairs: strictlyVerifiedArbitragePairs.length, identityMode: ARB_IDENTITY_MODE, identityRejectedPairs: Object.keys(identityRejectedPairs).length, positionManager: { intervalMs: POSITION_MONITOR_INTERVAL_MS, lastRunAt: positionMonitorLastRunAt, lastError: positionMonitorLastError, openPositions: (persistentWalletState.manualWallet?.openPositions?.length || 0) + (persistentWalletState.autoWallet?.openPositions?.length || 0) } }));
 app.get('/api/arbitrage-identity', (_, res) => res.json({ success: true, identityMode: ARB_IDENTITY_MODE, candidatePairs: arbitragePairs.length, strictlyVerifiedPairs: strictlyVerifiedArbitragePairs.length, rejectedPairs: identityRejectedPairs }));
 app.get('/api/arbitrage-status', (_, res) => {
   const opportunities = buildArbitrageOpportunities();
@@ -873,6 +1447,7 @@ app.post('/api/import-wallet', (req, res) => {
   try {
     const incoming = req.body?.manualWallet ? req.body : { manualWallet: req.body, autoWallet: persistentWalletState.autoWallet };
     persistentWalletState = sanitizeWalletState(incoming);
+    migratePersistentPositionState();
     saveWalletState();
     io.emit('load-wallet-state', persistentWalletState);
     res.json({ success: true });
@@ -1030,6 +1605,14 @@ function researchTradeRows(result, config, status = 'TRADED', error = '') {
       edge_qualified: snap.edgeQualified,
       edge_strong: snap.edgeStrong,
       reversal_confirmation_count: snap.reversalConfirmationCount,
+      recovery_stage: snap.recoveryStage,
+      recovery_confirmation_count: snap.recoveryConfirmationCount,
+      reclaimed_vwap: snap.reclaimedVwap,
+      reclaimed_ema21: snap.reclaimedEma21,
+      structure_recovered: snap.structureRecovered,
+      holds_above_vwap: snap.holdsAboveVwap,
+      momentum_turned_up: snap.momentumTurnedUp,
+      previous_structure: snap.prevStructure,
       selloff_decelerating: snap.selloffDecelerating,
       exhaustion_score: snap.exhaustionScore,
       exhaustion_raw_score: snap.exhaustionRawScore,
@@ -1104,7 +1687,7 @@ const RESEARCH_CSV_HEADERS = [
   'entry_signal','exit_reason','buy_price','sell_price','take_profit_price','stop_loss_price',
   'trade_amount_usd','fees_usd','net_pnl_usd','return_pct','lowest_price_dip','max_drawdown_pct',
   'hold_hours','rsi','macd','stochastic','cci','mfi','williams_r14_entry','roc9_pct','sma20','sma50','adx','adx_value','relative_volume','atr_pct','vwap','smc',
-  'ichimoku','consensus','consensus_score','v3_score','v4_score','pullback_score','breakout_score','setup_type','edge_quality_score','edge_setup_type','edge_qualified','edge_strong','reversal_confirmation_count','selloff_decelerating','exhaustion_score','exhaustion_raw_score','breakdown_penalty','williams_r14','williams_r14_prev','stoch_k','stoch_prev_k','stoch_rising','williams_rising','bb_position','below_lower_band_atr','last_body_atr','last_bearish_body','recent_3_return_pct',
+  'ichimoku','consensus','consensus_score','v3_score','v4_score','pullback_score','breakout_score','setup_type','edge_quality_score','edge_setup_type','edge_qualified','edge_strong','reversal_confirmation_count','recovery_stage','recovery_confirmation_count','reclaimed_vwap','reclaimed_ema21','structure_recovered','holds_above_vwap','momentum_turned_up','previous_structure','selloff_decelerating','exhaustion_score','exhaustion_raw_score','breakdown_penalty','williams_r14','williams_r14_prev','stoch_k','stoch_prev_k','stoch_rising','williams_rising','bb_position','below_lower_band_atr','last_body_atr','last_bearish_body','recent_3_return_pct',
   'ema21_distance_pct','ema50_distance_pct','vwap_distance_pct','recent_high_distance_pct','recent_low_distance_pct',
   'pullback_depth_pct','bars_since_local_high','ema21_slope_pct_3','rsi_prev_1','rsi_prev_2','rsi_delta_1','rsi_delta_2',
   'macd_histogram','macd_histogram_prev','macd_histogram_delta','bullish_candle','prev_return_1_pct','prev_return_2_pct','prev_return_3_pct',
@@ -1165,7 +1748,14 @@ function studyBucketsForDeal(d) {
     stoch_rising: String(s.stochRising),
     williams_rising: String(s.williamsRising),
     selloff_decelerating: String(s.selloffDecelerating),
-    edge_quality_band: numericBand(s.edgeQualityScore, [[4.5,'<4.5'],[5.5,'4.5-5.5'],[6.5,'5.5-6.5'],[7.5,'6.5-7.5'],[9999,'7.5+']])
+    recovery_stage: s.recoveryStage || 'UNKNOWN',
+    recovery_confirmations: numericBand(s.recoveryConfirmationCount, [[1,'0'],[2,'1'],[3,'2'],[99,'3+']]),
+    reclaimed_vwap: String(s.reclaimedVwap),
+    reclaimed_ema21: String(s.reclaimedEma21),
+    structure_recovered: String(s.structureRecovered),
+    holds_above_vwap: String(s.holdsAboveVwap),
+    momentum_turned_up: String(s.momentumTurnedUp),
+    edge_quality_band: numericBand(s.edgeQualityScore, [[4.75,'<4.75'],[6.25,'4.75-6.25'],[7.5,'6.25-7.5'],[9999,'7.5+']])
   };
 }
 
@@ -1199,6 +1789,53 @@ function writeSignalStudyFile(job) {
     fees_usd: Number(r.fees_usd.toFixed(8))
   })).sort((a,b) => a.dimension.localeCompare(b.dimension) || b.trades - a.trades);
   fs.writeFileSync(path.join(job.outputDir, 'signal_study_summary.csv'), objectsToCsv(rows, SIGNAL_STUDY_HEADERS), 'utf8');
+}
+
+
+const SL_WIDTH_STUDY_HEADERS = [
+  'sl_atr','trades','wins','losses','win_rate_pct','sl_hits','tp_hits','max_hold_exits','end_interval_exits',
+  'net_pnl_usd','gross_profit_usd','gross_loss_usd','profit_factor','fees_usd','avg_hold_hours','avg_mae_pct','avg_mfe_pct'
+];
+const SL_WIDTH_TRADE_HEADERS = [
+  'pair','timeframe','strategy_profile','trade_no','entry_time','entry_signal','target_level','entry_price','target_price',
+  'sl_atr','stop_price','exit_price','exit_reason','exit_time','hold_hours','mae_pct','mfe_pct','fees_usd','net_pnl_usd','return_pct','won'
+];
+
+function accumulateSlStudy(job, rows = []) {
+  if (!job.slStudyRows) job.slStudyRows = [];
+  job.slStudyRows.push(...rows);
+}
+
+function writeSlStudyFiles(job) {
+  const raw = job.slStudyRows || [];
+  const detailed = raw.map(r => ({
+    ...r,
+    entry_time: new Date(Number(r.entry_time_ms)).toISOString(),
+    exit_time: new Date(Number(r.exit_time_ms)).toISOString()
+  }));
+  fs.writeFileSync(path.join(job.outputDir, 'sl_width_trade_details.csv'), objectsToCsv(detailed, SL_WIDTH_TRADE_HEADERS), 'utf8');
+
+  const grouped = new Map();
+  for (const r of raw) {
+    const k = String(r.sl_atr);
+    const g = grouped.get(k) || { sl_atr:r.sl_atr,trades:0,wins:0,losses:0,sl_hits:0,tp_hits:0,max_hold_exits:0,end_interval_exits:0,net_pnl_usd:0,gross_profit_usd:0,gross_loss_usd:0,fees_usd:0,hold:0,mae:0,mfe:0 };
+    const pnl=Number(r.net_pnl_usd||0); g.trades++; if (pnl>0){g.wins++;g.gross_profit_usd+=pnl}else{g.losses++;g.gross_loss_usd+=Math.abs(pnl)};
+    if (String(r.exit_reason).startsWith('SL')) g.sl_hits++;
+    else if (r.exit_reason==='TP') g.tp_hits++;
+    else if (r.exit_reason==='MAX_HOLD') g.max_hold_exits++;
+    else g.end_interval_exits++;
+    g.net_pnl_usd+=pnl; g.fees_usd+=Number(r.fees_usd||0); g.hold+=Number(r.hold_hours||0); g.mae+=Number(r.mae_pct||0); g.mfe+=Number(r.mfe_pct||0); grouped.set(k,g);
+  }
+  const summary=[...grouped.values()].sort((a,b)=>a.sl_atr-b.sl_atr).map(g=>({
+    ...g,
+    win_rate_pct:g.trades?Number((g.wins/g.trades*100).toFixed(3)):0,
+    profit_factor:g.gross_loss_usd>0?Number((g.gross_profit_usd/g.gross_loss_usd).toFixed(4)):(g.gross_profit_usd>0?'INF':0),
+    avg_hold_hours:g.trades?Number((g.hold/g.trades).toFixed(4)):0,
+    avg_mae_pct:g.trades?Number((g.mae/g.trades).toFixed(4)):0,
+    avg_mfe_pct:g.trades?Number((g.mfe/g.trades).toFixed(4)):0,
+    net_pnl_usd:Number(g.net_pnl_usd.toFixed(8)),gross_profit_usd:Number(g.gross_profit_usd.toFixed(8)),gross_loss_usd:Number(g.gross_loss_usd.toFixed(8)),fees_usd:Number(g.fees_usd.toFixed(8))
+  }));
+  fs.writeFileSync(path.join(job.outputDir, 'sl_width_study.csv'), objectsToCsv(summary, SL_WIDTH_STUDY_HEADERS), 'utf8');
 }
 
 // Tiny ZIP writer using the STORE method, so the project needs no extra npm package.
@@ -1281,6 +1918,10 @@ function publicJob(job) {
     totalFeesUSD: Number(job.totalFeesUSD.toFixed(2)),
     totalNetPnlUSD: Number(job.totalNetPnlUSD.toFixed(2)),
     currentMessage: job.currentMessage,
+    cycleState: job.cycleState || 'QUEUED',
+    currentCandleTime: job.currentCandleTime || null,
+    currentEntry: job.currentEntry || null,
+    recentEvents: (job.recentEvents || []).slice(-12),
     lastCompleted: job.lastCompleted,
     outputFolder: path.relative(__dirname, job.outputDir).replace(/\\/g, '/'),
     downloadReady: Boolean(job.zipPath && fs.existsSync(job.zipPath)),
@@ -1299,7 +1940,7 @@ async function runSequentialResearchJob(job) {
     for (let idx = 0; idx < job.assetList.length; idx++) {
       const symbol = job.assetList[idx];
       job.currentCoin = symbol;
-      job.currentMessage = `Coin ${idx + 1}/${job.assetList.length}: downloading + testing ${symbol}`;
+      job.currentMessage = `Coin ${idx + 1}/${job.assetList.length}: scanning full interval for repeated BUY → EXIT cycles on ${symbol}`;
       const prefix = String(idx + 1).padStart(String(job.assetList.length).length, '0');
       const fileName = `${prefix}_${safePathPart(symbol.replace('/', '_'))}.csv`;
       const filePath = path.join(job.outputDir, fileName);
@@ -1315,10 +1956,21 @@ async function runSequentialResearchJob(job) {
           forceManualEntry: false,
           strategyProfile: job.config.strategyProfile,
           benchmarkCandles: benchmark.candles,
-          benchmarkTimeframe: benchmark.timeframe
+          benchmarkTimeframe: benchmark.timeframe,
+          onProgress: (evt) => {
+            job.cycleState = evt.type || 'SCANNING';
+            job.currentCandleTime = evt.candleTimeMs ? new Date(evt.candleTimeMs).toISOString() : null;
+            if (evt.type === 'ENTERED') job.currentEntry = { pair: symbol, entryPrice: evt.entryPrice, entryReason: evt.entryReason, tp: evt.tp, sl: evt.sl, entryTime: job.currentCandleTime };
+            if (evt.type === 'EXIT') job.currentEntry = null;
+            const label = evt.type === 'ENTERED' ? `ENTER ${symbol} @ ${evt.entryPrice}` : evt.type === 'EXIT' ? `SELL ${symbol} @ ${evt.exitPrice} · ${evt.exitReason} · P/L ${Number(evt.pnl||0).toFixed(2)}` : `${evt.type} ${symbol}`;
+            job.recentEvents = job.recentEvents || [];
+            if (!job.recentEvents.length || job.recentEvents[job.recentEvents.length - 1]?.label !== label) job.recentEvents.push({ at: new Date().toISOString(), candleTime: job.currentCandleTime, type: evt.type, label });
+            if (job.recentEvents.length > 30) job.recentEvents = job.recentEvents.slice(-30);
+          }
         });
         const deals = r.closedDeals || [];
         accumulateSignalStudy(job, deals);
+        accumulateSlStudy(job, r.slStudyRows || []);
         const rows = researchTradeRows(r, { ...job.config, symbol }, deals.length ? 'TRADED' : 'NO_SIGNALS', '');
         fs.writeFileSync(filePath, objectsToCsv(rows), 'utf8');
         const wins = deals.filter(d => Number(d.netProfitUSD) > 0).length;
@@ -1369,6 +2021,7 @@ async function runSequentialResearchJob(job) {
       job.currentMessage = `Saved ${fileName}; moving to next coin...`;
       writeCoinSummaryFile(job); // Persist progress after EVERY coin.
       writeSignalStudyFile(job);
+      writeSlStudyFiles(job);
       fs.writeFileSync(path.join(job.outputDir, 'run_manifest.json'), JSON.stringify({ ...publicJob(job), coinSummaries: job.coinSummaries }, null, 2));
     }
 
@@ -1378,6 +2031,7 @@ async function runSequentialResearchJob(job) {
     job.currentMessage = `Completed ${job.completedCoins}/${job.totalCoins} coins. Creating ZIP...`;
     writeCoinSummaryFile(job);
     writeSignalStudyFile(job);
+    writeSlStudyFiles(job);
     fs.writeFileSync(path.join(job.outputDir, 'run_manifest.json'), JSON.stringify({ ...publicJob(job), coinSummaries: job.coinSummaries }, null, 2));
     createResearchZip(job);
     job.currentMessage = 'Research complete. All per-coin CSV files are saved.';
@@ -1402,20 +2056,12 @@ app.post('/api/research-jobs', async (req, res) => {
     const ranked = await refreshBinanceVolumeRanking();
     const source = scanLimit === 'all' ? [...binanceSignalPairs] : ranked.slice(0, scanLimit);
     const allowed = new Set(binanceSignalPairs);
-    const spotOnlyResearch = Boolean(req.body?.spotOnlyResearch);
-    const requestedSymbols = Array.isArray(req.body?.selectedSymbols) ? req.body.selectedSymbols : [];
-
-    let assetList;
-    if (spotOnlyResearch) {
-      const sourceSet = new Set(source);
-      assetList = [...new Set(requestedSymbols)]
-        .filter(s => typeof s === 'string' && allowed.has(s) && sourceSet.has(s));
-      if (!assetList.length) {
-        return res.status(400).json({ success:false, message:'SPOT MODE is enabled, but no BUY / STRONG BUY symbols from the interval-start scan are eligible for this research run.' });
-      }
-    } else {
-      assetList = [...new Set(source)].filter(s => allowed.has(s));
-    }
+    // V5.6 full-interval research deliberately does NOT pre-filter coins by the
+    // signal visible at the interval start. Every selected/ranked eligible coin is
+    // scanned candle-by-candle for the complete interval. A coin can enter, exit,
+    // then resume scanning and enter again repeatedly until endMs.
+    const spotOnlyResearch = Boolean(req.body?.spotOnlyResearch); // retained for UI/config compatibility
+    const assetList = [...new Set(source)].filter(s => allowed.has(s));
     if (!assetList.length) return res.status(400).json({ success:false, message:'No eligible Binance spot pairs are available.' });
 
     const stamp = new Date().toISOString().replace(/[:.]/g,'-');
@@ -1425,9 +2071,9 @@ app.post('/api/research-jobs', async (req, res) => {
     const job = {
       id, status:'QUEUED', createdAt:new Date().toISOString(), startedAt:null, finishedAt:null,
       totalCoins:assetList.length, completedCoins:0, currentCoin:'', tradedCoins:0, noSignalCoins:0,
-      dataErrorCoins:0, totalTrades:0, totalWins:0, totalLosses:0, grossProfitUSD:0, grossLossUSD:0, totalFeesUSD:0, totalNetPnlUSD:0, currentMessage:'Queued', lastCompleted:null,
-      assetList, coinSummaries:[], signalStudy:new Map(), outputDir, zipPath:null,
-      config:{ timeframe, startMs, endMs, budget, tpLevel, strategyProfile, scanLimit, spotOnlyResearch, intervalStartCandidateCount: spotOnlyResearch ? assetList.length : null }
+      dataErrorCoins:0, totalTrades:0, totalWins:0, totalLosses:0, grossProfitUSD:0, grossLossUSD:0, totalFeesUSD:0, totalNetPnlUSD:0, currentMessage:'Queued', cycleState:'QUEUED', currentCandleTime:null, currentEntry:null, recentEvents:[], lastCompleted:null,
+      assetList, coinSummaries:[], signalStudy:new Map(), slStudyRows:[], outputDir, zipPath:null,
+      config:{ timeframe, startMs, endMs, budget, tpLevel, strategyProfile, scanLimit, spotOnlyResearch, fullIntervalSignalScan: true, signalCycleResearch: true, signalExitPolicy: 'V5.16_TIMEFRAME_ROUTER_BEARISH_STRUCTURE_EXIT', slWidthStudyAtr: SL_STUDY_ATR_MULTIPLIERS, intervalStartCandidateCount: null }
     };
     researchJobs.set(id, job);
     setImmediate(() => runSequentialResearchJob(job));
@@ -1663,7 +2309,7 @@ async function initializeServer() {
   try { await refreshRealQuotes(); } catch {}
   try { await getSignalData('30m', true, STRATEGY_PROFILES.TIMEFRAME_EDGE_SPOT); } catch {}
 
-  console.log(`🚀 Quant Hub V5.4 running on http://localhost:3000`);
+  console.log(`🚀 Quant Hub V5.16 running on http://localhost:3000`);
   console.log(`   Eligible union: ${allEligiblePairs.length} | Binance signals: ${binanceSignalPairs.length} | Arbitrage quote candidates: ${arbitragePairs.length} | Strictly verified: ${strictlyVerifiedArbitragePairs.length}`);
   console.log(`   Identity mode: ${ARB_IDENTITY_MODE} | User-excluded bases: ${USER_EXCLUDED_BASES.size} | Strictly-unverified candidates: ${Object.keys(identityRejectedPairs).length}`);
 }
@@ -1678,7 +2324,11 @@ io.on('connection', socket => {
 
   socket.on('sync-wallet-state', newState => {
     persistentWalletState = sanitizeWalletState(newState);
+    migratePersistentPositionState();
     saveWalletState();
+    // A newly opened/edited position should be picked up immediately instead of
+    // waiting for the next monitor interval.
+    monitorOpenPositions().catch(() => {});
   });
 
   socket.on('change-timeframe', async newTf => {
@@ -1703,7 +2353,13 @@ io.on('connection', socket => {
 });
 
 setInterval(() => refreshRealQuotes().catch(() => {}), 8_000);
+setInterval(() => monitorOpenPositions().catch(() => {}), POSITION_MONITOR_INTERVAL_MS);
 
 httpServer.listen(3000, async () => {
   await initializeServer();
+  console.log('🛡️  V5.5 server-side Position Manager enabled');
+  console.log('   Restoring persistent TP/SL and reconciling offline candles...');
+  await reconcileAllOpenPositionsOnStartup();
+  await monitorOpenPositions();
+  console.log(`   Position Manager active · check interval ${POSITION_MONITOR_INTERVAL_MS / 1000}s`);
 });

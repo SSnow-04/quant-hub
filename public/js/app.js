@@ -802,6 +802,30 @@ window.toggleSpotFilter = function() {
 };
 
 
+
+const TIMEFRAME_STRATEGY_INFO = {
+    '1m':  { label: 'Execution Only / Fill Timing', detail: 'No standalone entries. Use after a higher-timeframe BUY to improve execution.' },
+    '3m':  { label: 'Execution Only / Micro Confirmation', detail: 'No standalone entries. Use for micro confirmation after 5m/15m/30m setup.' },
+    '5m':  { label: 'Entry Trigger / Micro Trend', detail: 'Strict VWAP/EMA reclaim + momentum trigger. Designed for fast entries, not oversold guessing.' },
+    '15m': { label: 'Trend Pullback + Reclaim', detail: 'Buy controlled dips inside an existing bullish trend after support/reclaim confirmation.' },
+    '30m': { label: 'Recovery Reversal', detail: 'Exhaustion is WATCH only; BUY requires recovery/reclaim confirmation.' },
+    '1h':  { label: 'Controlled Trend / Pullback', detail: 'Trend-aligned continuation with reasonable location; avoid chased entries.' },
+    '2h':  { label: 'Swing Pullback Continuation', detail: 'Swing pullback into EMA/VWAP support with recovery confirmation.' },
+    '4h':  { label: 'Trend Continuation', detail: 'Main medium-term trend continuation with structure and momentum alignment.' },
+    '6h':  { label: 'Trend Continuation / Swing Hold', detail: 'Slower continuation setup with wider holding window.' },
+    '8h':  { label: 'Swing Trend Continuation', detail: 'Higher-timeframe trend and structure continuation.' },
+    '12h': { label: 'Macro Pullback', detail: 'Macro trend dip/retest entries rather than short-term reversal chasing.' },
+    '1d':  { label: 'Macro Trend Continuation', detail: 'Daily trend/structure continuation for position-style spot trades.' },
+    '3d':  { label: 'Position Trend / Major Pullback', detail: 'Position trade bias with major trend and structure alignment.' },
+    '1w':  { label: 'Macro Regime / Position Bias', detail: 'Long-horizon regime and position bias; very low signal frequency.' }
+};
+
+function updateTimeframeStrategyHint(tf) {
+    const info = TIMEFRAME_STRATEGY_INFO[tf] || { label: 'Timeframe Edge', detail: '' };
+    const el = document.getElementById('timeframeStrategyHint');
+    if (el) el.innerHTML = `<strong>${tf} best fit:</strong> ${info.label}<br><span style="color:var(--text-muted);">${info.detail}</span>`;
+}
+
 window.changeLiveStrategyProfile = function() {
     const profile = document.getElementById('liveStrategyProfileSelect')?.value || 'TIMEFRAME_EDGE_SPOT';
     const sigBody = document.getElementById('signals-body');
@@ -811,6 +835,7 @@ window.changeLiveStrategyProfile = function() {
 
 window.changeTimeframe = function() {
     const tf = document.getElementById('timeframeSelect').value;
+    updateTimeframeStrategyHint(tf);
     const portSelect = document.getElementById('portfolioTimeframeSelect');
     if (portSelect) portSelect.value = tf;
     
@@ -821,6 +846,7 @@ window.changeTimeframe = function() {
 
 window.changePortfolioTimeframe = function() {
     const tf = document.getElementById('portfolioTimeframeSelect').value;
+    updateTimeframeStrategyHint(tf);
     const mainSelect = document.getElementById('timeframeSelect');
     if (mainSelect) mainSelect.value = tf;
 
@@ -1023,10 +1049,14 @@ function renderSignalsTable() {
     displayArray.forEach(s => {
         const tr = document.createElement('tr');
         let tradeBtn = '';
-        if (s.finalSignal.includes('BUY') || s.finalSignal.includes('NEUTRAL')) {
+        if (s.finalSignal.includes('BUY')) {
             tradeBtn = `<button class="trade-btn" onclick="manualPaperTrade('${s.pair}', 'binance', 'binance', ${s.price}, ${s.tp1}, ${s.tp2}, ${s.tp3}, ${s.suggestedSL}, 'Alpha Tech Screener')">🟢 Buy Spot</button>`;
+        } else if (s.finalSignal.includes('WATCH') || s.finalSignal.includes('WAIT')) {
+            tradeBtn = `<span style="color:#f59e0b; font-size:12px; font-weight:bold;">🟡 Watch / Wait</span>`;
+        } else if (s.finalSignal.includes('AVOID')) {
+            tradeBtn = `<span style="color:#ef4444; font-size:12px; font-weight:bold;">🔴 Avoid / Cash</span>`;
         } else {
-            tradeBtn = `<span style="color: var(--text-muted); font-size: 12px; font-weight: bold;">🚫 Avoid (Bearish)</span>`;
+            tradeBtn = `<span style="color:var(--text-muted); font-size:12px; font-weight:bold;">⚪ Cash / No Entry</span>`;
         }
 
         const activeInfo = getActivePositionForPair(s.pair);
@@ -1041,6 +1071,7 @@ function renderSignalsTable() {
         tr.innerHTML = `
             <td style="font-weight: bold;">
                 ${s.pair}
+                <span class="sub-text" style="color:#a78bfa;">${s.recommendedStrategy || s.setupType || ''}</span>
                 ${activeBadge}
             </td>
             <td>
@@ -1064,9 +1095,12 @@ function renderSignalsTable() {
                     <span class="${getValClass(s.ichimokuStr)}">${s.ichimokuStr}</span>
                 </span>
             </td>
-            <td style="font-weight: bold; color: ${s.signalColor};">${s.finalSignal}</td>
+            <td style="font-weight: bold; color: ${s.signalColor};">
+                ${s.finalSignal}
+                ${s.kronosLabel ? `<span class="sub-text" style="color:${s.kronosLabel === 'BULLISH' ? '#34d399' : s.kronosLabel === 'BEARISH' ? '#f87171' : '#94a3b8'};">🧠 Kronos: ${s.kronosLabel} ${Number(s.kronosForecastReturnPct || 0) >= 0 ? '+' : ''}${Number(s.kronosForecastReturnPct || 0).toFixed(2)}% · score ${Number(s.kronosScore || 0).toFixed(2)}</span>` : `<span class="sub-text" style="color:#64748b;">🧠 Kronos: waiting/offline</span>`}
+            </td>
             <td style="font-size: 12px; font-weight: bold; line-height: 1.5;">
-                <span class="negative">SL (1.5x ATR): $${formatPrice(s.stopPrice)} (-${s.suggestedSL}%)</span><br>
+                <span class="negative">SL (2.5x ATR): $${formatPrice(s.stopPrice)} (-${s.suggestedSL}%)</span><br>
                 <span class="positive">TP1 (1.0x ATR): $${formatPrice(s.tp1Price)} (+${s.tp1}%)</span><br>
                 <span class="positive">TP2 (2.0x ATR): $${formatPrice(s.tp2Price)} (+${s.tp2}%)</span><br>
                 <span class="positive">TP3 (3.5x ATR): $${formatPrice(s.tp3Price)} (+${s.tp3}%)</span>
@@ -1093,11 +1127,8 @@ socket.on('signals-update', (signals) => {
         fallbackTickers.binance[s.pair] = { bid: s.price, ask: s.price };
     });
     
-    manualWallet.checkLimits(fallbackTickers);
-    autoWallet.checkLimits(fallbackTickers);
-    manualWallet.checkSignalExits(latestSignalsArray);
-    autoWallet.checkSignalExits(latestSignalsArray);
-
+    // V5.5: TP/SL/max-hold execution is owned by the Node backend.
+    // The browser is display/control only; closing this tab must not stop exits.
     renderSignalsTable();
     window.calculatePortfolioAllocation();
 });
@@ -1107,9 +1138,7 @@ socket.on('global-scanner-update', (payload) => {
     const rawTickers = payload.rawTickers || {};
     const status = payload.status || {};
 
-    manualWallet.checkLimits(rawTickers);
-    autoWallet.checkLimits(rawTickers);
-
+    // V5.5: raw quotes are displayed here, but position exits are server-managed.
     const scanBody = document.getElementById('scanner-body');
     if (!scanBody) return;
 
@@ -1170,3 +1199,4 @@ socket.on('global-scanner-update', (payload) => {
         scanBody.appendChild(tr);
     });
 });
+setTimeout(() => updateTimeframeStrategyHint(document.getElementById('timeframeSelect')?.value || '5m'), 0);

@@ -34,6 +34,28 @@ export const STRATEGY_PROFILES = Object.freeze({
   TIMEFRAME_EDGE_SPOT: 'TIMEFRAME_EDGE_SPOT'
 });
 
+
+export function recommendedStrategyForTimeframe(tf = '30m') {
+  const t = normalizeTimeframe(tf);
+  const map = {
+    '1m':  { name: 'EXECUTION_ONLY_1M', label: 'Execution only / spread & fill timing', standalone: false },
+    '3m':  { name: 'EXECUTION_ONLY_3M', label: 'Execution only / micro confirmation', standalone: false },
+    '5m':  { name: 'ENTRY_TRIGGER_5M', label: 'Entry trigger / micro trend continuation', standalone: true },
+    '15m': { name: 'TREND_PULLBACK_15M', label: 'Trend pullback + reclaim', standalone: true },
+    '30m': { name: 'RECOVERY_REVERSAL_30M', label: 'Recovery reversal after exhaustion', standalone: true },
+    '1h':  { name: 'CONTROLLED_TREND_1H', label: 'Controlled trend / pullback continuation', standalone: true },
+    '2h':  { name: 'SWING_PULLBACK_2H', label: 'Swing pullback continuation', standalone: true },
+    '4h':  { name: 'TREND_CONTINUATION_4H', label: 'Trend continuation', standalone: true },
+    '6h':  { name: 'TREND_CONTINUATION_6H', label: 'Trend continuation / swing hold', standalone: true },
+    '8h':  { name: 'SWING_CONTINUATION_8H', label: 'Swing trend continuation', standalone: true },
+    '12h': { name: 'MACRO_PULLBACK_12H', label: 'Macro pullback continuation', standalone: true },
+    '1d':  { name: 'MACRO_TREND_1D', label: 'Macro trend continuation', standalone: true },
+    '3d':  { name: 'POSITION_TREND_3D', label: 'Position trend / major pullback', standalone: true },
+    '1w':  { name: 'MACRO_REGIME_1W', label: 'Macro regime / position bias', standalone: true }
+  };
+  return map[t] || { name: 'TIMEFRAME_EDGE', label: 'Timeframe edge', standalone: true };
+}
+
 export function regimeTimeframeForTrade(tf = '30m') {
   const t = normalizeTimeframe(tf);
   if (['1m','3m','5m','15m','30m','1h'].includes(t)) return '4h';
@@ -287,6 +309,7 @@ export function analyzeMarket(ohlcv, options = {}) {
   const ema9 = last(ema9Series, currentPrice);
   const ema21 = last(ema21Series, currentPrice);
   const ema50 = last(ema50Series, currentPrice);
+  const ema21Prev1 = ema21Series.length > 1 ? ema21Series[ema21Series.length - 2] : ema21;
   const ema21Prev3 = ema21Series.length > 3 ? ema21Series[ema21Series.length - 4] : ema21;
   const sma20 = last(SMA.calculate({ values: close, period: 20 }), currentPrice);
   const sma50 = last(SMA.calculate({ values: close, period: 50 }), currentPrice);
@@ -298,10 +321,13 @@ export function analyzeMarket(ohlcv, options = {}) {
   const cci = last(CCI.calculate({ high, low, close, period: 20 }), 0);
   const mfi = last(MFI.calculate({ high, low, close, volume, period: 14 }), 50);
   const vwap = calculateVWAP(high, low, close, volume);
+  const prevClose = close.length > 1 ? close.at(-2) : currentPrice;
+  const prevVwap = close.length > 1 ? calculateVWAP(high.slice(0, -1), low.slice(0, -1), close.slice(0, -1), volume.slice(0, -1)) : vwap;
   const vpvr = calculateVPVR(data);
   const ichimoku = calculateIchimoku(high, low, close);
   const supertrendBullish = calculateSupertrend(high, low, close);
   const structure = detectMarketStructure(high, low, close);
+  const prevStructure = close.length > 6 ? detectMarketStructure(high.slice(0, -1), low.slice(0, -1), close.slice(0, -1)) : structure;
   const linReg = calculateLinearRegression(close, 14);
   const utBot = calculateUTBot(high, low, close, 2, 1);
   const percentR = calculatePercentRExhaustion(high, low, close);
@@ -630,61 +656,195 @@ export function analyzeMarket(ohlcv, options = {}) {
   const selloffDecelerating = prevReturn1Pct > prevReturn2Pct || rsiDelta1 > -0.5 || macdHistogramDelta > 0;
   const shortReversalConfirmations = [stochRising, williamsRising, macdHistogramDelta > 0, bullishCandle, selloffDecelerating].filter(Boolean).length;
 
-  if (timeframe === '4h') {
-    edgeSetupType = 'TREND_CONTINUATION_4H';
-    const trendOk = ema21 > ema50 && currentPrice > ema50 && ema21SlopePct3 > 0 && adxValue >= 27;
-    const structureOk = !isStructureBearish && structure !== 'CHOP (Ranging)';
-    const momentumOk = roc9Pct > -0.5 || macdHistogramDelta > 0;
-    const participationOk = relativeVolume >= 0.65 && relativeVolume <= 4.0;
-    const extensionOk = rsi <= 74 && Number(stoch.k) <= 86 && bbPosition <= 1.25;
-    if (!trendOk) edgeRejectionReasons.push('4h trend continuation gate failed');
-    if (!structureOk) edgeRejectionReasons.push('4h CHOP/bearish structure rejected');
-    if (!momentumOk) edgeRejectionReasons.push('4h momentum is deteriorating');
-    if (!participationOk) edgeRejectionReasons.push('4h participation outside useful range');
-    if (!extensionOk) edgeRejectionReasons.push('4h entry too extended');
-    edgeQualityScore = (trendOk ? 2 : 0) + (structureOk ? 2 : 0) + (isAboveVWAP ? 0.75 : 0) + (relativeVolume >= 1.0 ? 0.75 : 0) + (relativeVolume >= 1.5 ? 0.5 : 0) + (adxValue >= 36 ? 1 : 0) + (roc9Pct > 0 ? 0.75 : 0) + (macdHistogramDelta > 0 ? 0.5 : 0);
-    edgeQualified = trendOk && structureOk && momentumOk && participationOk && extensionOk && edgeQualityScore >= 5.0;
-    edgeStrong = edgeQualified && adxValue >= 36 && relativeVolume >= 1.0 && edgeQualityScore >= 6.25;
-  } else if (timeframe === '1h') {
-    edgeSetupType = 'CONTROLLED_TREND_1H';
-    const trendOk = ema21 > ema50 && currentPrice > ema50 && ema21SlopePct3 > 0 && adxValue >= 28;
-    const structureOk = !isStructureBearish && structure !== 'CHOP (Ranging)';
-    const locationOk = currentPrice >= vwap || vwapDistanceAtr <= 0.5;
-    const chaseOk = recent3ReturnPct <= 1.5 && recent3ReturnPct >= -4.0 && Number(stoch.k) <= 83 && rsi <= 70;
-    const participationOk = relativeVolume >= 0.6 && relativeVolume <= 3.5;
-    if (!trendOk) edgeRejectionReasons.push('1h controlled-trend gate failed');
-    if (!structureOk) edgeRejectionReasons.push('1h CHOP/bearish structure rejected');
-    if (!locationOk) edgeRejectionReasons.push('1h price is too weak versus VWAP');
-    if (!chaseOk) edgeRejectionReasons.push('1h entry is chased/overextended or collapsing');
-    if (!participationOk) edgeRejectionReasons.push('1h participation outside useful range');
-    edgeQualityScore = (trendOk ? 2 : 0) + (structureOk ? 1.75 : 0) + (locationOk ? 1 : 0) + (adxValue >= 34 ? 0.75 : 0) + (relativeVolume >= 0.9 ? 0.75 : 0) + (recent3ReturnPct <= 0.5 ? 0.6 : 0) + (rsi >= 45 && rsi <= 66 ? 0.5 : 0);
-    edgeQualified = trendOk && structureOk && locationOk && chaseOk && participationOk && edgeQualityScore >= 4.75;
-    edgeStrong = edgeQualified && adxValue >= 34 && relativeVolume >= 0.9 && edgeQualityScore >= 5.75;
-  } else if (timeframe === '30m') {
-    edgeSetupType = 'EXHAUSTION_REVERSAL_30M';
-    const dipOk = recent3ReturnPct <= -0.30 && recent3ReturnPct >= -2.50;
-    const exhaustionOk = exhaustionScore >= 4.2 && exhaustionScore <= 7.0;
-    const participationOk = relativeVolume >= 0.9 && relativeVolume <= 3.5;
-    const volatilityOk = atrPct >= 0.40 && atrPct <= 1.30;
-    const breakdownOk = breakdownPenalty > -2.0 && belowLowerBandAtr <= 0.9 && !(lastBearishBody && lastBodyPctAtr > 1.8);
-    const locationOk = bbPosition <= 0.55 || currentPrice <= ema21 || vwapDistanceAtr <= 1.5;
-    const reversalOk = shortReversalConfirmations >= 1;
-    if (!dipOk) edgeRejectionReasons.push('30m requires a controlled -0.3% to -2.5% three-bar dip');
-    if (!exhaustionOk) edgeRejectionReasons.push('30m exhaustion is too weak or too extreme');
-    if (!participationOk) edgeRejectionReasons.push('30m RVOL outside 0.9–3.5');
-    if (!volatilityOk) edgeRejectionReasons.push('30m ATR outside useful 0.4%–1.3% range');
-    if (!breakdownOk) edgeRejectionReasons.push('30m accelerating breakdown risk');
-    if (!locationOk) edgeRejectionReasons.push('30m not in a useful discount/pullback location');
-    if (!reversalOk) edgeRejectionReasons.push('30m exhaustion detected but reversal has not started');
-    edgeQualityScore = (dipOk ? 1.25 : 0) + (exhaustionOk ? 1.5 : 0) + (participationOk ? 1.25 : 0) + (volatilityOk ? 1.25 : 0) + (breakdownOk ? 1 : 0) + (locationOk ? 0.75 : 0) + Math.min(1.5, shortReversalConfirmations * 0.5);
-    edgeQualified = dipOk && exhaustionOk && participationOk && volatilityOk && breakdownOk && locationOk && reversalOk && edgeQualityScore >= 6.0;
-    edgeStrong = edgeQualified && exhaustionScore >= 5.0 && exhaustionScore <= 6.8 && relativeVolume >= 1.0 && atrPct >= 0.55 && atrPct <= 1.10 && shortReversalConfirmations >= 1 && edgeQualityScore >= 7.0;
+  // V5.15 recovery-state features. Oversold/CHOCH is a setup state, not an entry.
+  // A 30m long must show that price has actually reclaimed something meaningful.
+  const reclaimedVwap = Number.isFinite(prevVwap) && prevClose <= prevVwap && currentPrice > vwap;
+  const reclaimedEma21 = prevClose <= ema21Prev1 && currentPrice > ema21;
+  const bullishStructureNow = /bullish structure|bos \(bullish\)/i.test(structure);
+  const bearishTransitionBefore = /choch|bearish structure/i.test(prevStructure);
+  const structureRecovered = bearishTransitionBefore && bullishStructureNow;
+  const holdsAboveVwap = isAboveVWAP && prevClose > prevVwap;
+  const momentumTurnedUp = macdHistogramDelta > 0 && rsiDelta1 > 0;
+  const recoveryConfirmationCount = [reclaimedVwap, reclaimedEma21, structureRecovered, holdsAboveVwap, momentumTurnedUp].filter(Boolean).length;
+  let recoveryStage = 'EXHAUSTED / WATCH';
+
+  const timeframeStrategy = recommendedStrategyForTimeframe(timeframe);
+
+  if (timeframe === '1m' || timeframe === '3m') {
+    edgeSetupType = timeframeStrategy.name;
+    recoveryStage = 'EXECUTION ONLY';
+    edgeRejectionReasons.push(`${timeframe} is execution-only: use it to improve fill timing after a higher-timeframe setup, not to create a standalone position`);
   } else if (timeframe === '5m') {
-    edgeSetupType = 'ENTRY_CONFIRMATION_5M';
-    edgeRejectionReasons.push('5m is confirmation-only in V5.4; it cannot open a standalone trade');
+    edgeSetupType = 'ENTRY_TRIGGER_5M';
+    const trendOk = ema9 > ema21 && ema21 >= ema50 * 0.995 && ema21SlopePct3 >= -0.15;
+    const structureOk = !isStructureBearish && structure !== 'CHOP (Ranging)';
+    const locationOk = currentPrice >= vwap || reclaimedVwap || reclaimedEma21 || priceNearVwap || priceNearEma21;
+    const triggerOk = reclaimedVwap || reclaimedEma21 || (momentumTurnedUp && bullishCandle) || (macdHistogramDelta > 0 && currentPrice > ema9);
+    const participationOk = relativeVolume >= 0.65 && relativeVolume <= 4.5;
+    const extensionOk = rsi >= 38 && rsi <= 72 && Number(stoch.k) <= 86 && bbPosition <= 1.10 && recent3ReturnPct <= 2.2;
+    if (!trendOk) edgeRejectionReasons.push('5m micro trend is not aligned');
+    if (!structureOk) edgeRejectionReasons.push('5m bearish/CHOP structure rejected');
+    if (!locationOk) edgeRejectionReasons.push('5m price has not reclaimed or reached VWAP/EMA support');
+    if (!triggerOk) edgeRejectionReasons.push('5m waiting for reclaim or momentum trigger');
+    if (!participationOk) edgeRejectionReasons.push('5m participation outside useful range');
+    if (!extensionOk) edgeRejectionReasons.push('5m move is too extended or oscillator state is poor');
+    edgeQualityScore = (trendOk ? 1.6 : 0) + (structureOk ? 1.4 : 0) + (reclaimedVwap ? 1.6 : 0) + (reclaimedEma21 ? 1.2 : 0) + (momentumTurnedUp ? 1.0 : 0) + (currentPrice > vwap ? 0.6 : 0) + (relativeVolume >= 1 ? 0.6 : 0);
+    edgeQualified = trendOk && structureOk && locationOk && triggerOk && participationOk && extensionOk && edgeQualityScore >= 4.3;
+    edgeStrong = edgeQualified && (reclaimedVwap || reclaimedEma21) && momentumTurnedUp && recoveryConfirmationCount >= 2 && edgeQualityScore >= 5.8;
+    recoveryStage = edgeStrong ? 'ENTRY TRIGGER STRONG' : edgeQualified ? 'ENTRY TRIGGER CONFIRMED' : 'WAITING FOR 5M TRIGGER';
+  } else if (timeframe === '15m') {
+    edgeSetupType = 'TREND_PULLBACK_15M';
+    const trendOk = ema21 > ema50 && currentPrice > ema50 && ema21SlopePct3 > 0;
+    const structureOk = !isStructureBearish && structure !== 'CHOP (Ranging)';
+    const pullbackOk = (priceNearEma21 || priceNearVwap || recentRetestEma21 || recentRetestVwap || reclaimedEma21 || reclaimedVwap) && pullbackDepthPct >= 0.35 && pullbackDepthPct <= 6.0;
+    const recoveryOk15 = reclaimedVwap || reclaimedEma21 || momentumTurnedUp || (bullishCandle && macdHistogramDelta > 0);
+    const participationOk = relativeVolume >= 0.6 && relativeVolume <= 4.0;
+    const extensionOk = rsi <= 72 && Number(stoch.k) <= 85 && bbPosition <= 1.10 && recent3ReturnPct <= 2.0;
+    if (!trendOk) edgeRejectionReasons.push('15m trend pullback requires EMA21>EMA50 with a rising EMA21');
+    if (!structureOk) edgeRejectionReasons.push('15m bearish/CHOP structure rejected');
+    if (!pullbackOk) edgeRejectionReasons.push('15m waiting for a real pullback into EMA21/VWAP support');
+    if (!recoveryOk15) edgeRejectionReasons.push('15m pullback has not turned back upward');
+    if (!participationOk) edgeRejectionReasons.push('15m participation outside useful range');
+    if (!extensionOk) edgeRejectionReasons.push('15m entry is already extended');
+    edgeQualityScore = (trendOk ? 2.0 : 0) + (structureOk ? 1.5 : 0) + (pullbackOk ? 1.25 : 0) + (reclaimedVwap ? 1.25 : 0) + (reclaimedEma21 ? 1.0 : 0) + (momentumTurnedUp ? 0.75 : 0) + (relativeVolume >= 1 ? 0.5 : 0);
+    edgeQualified = trendOk && structureOk && pullbackOk && recoveryOk15 && participationOk && extensionOk && edgeQualityScore >= 4.75;
+    edgeStrong = edgeQualified && recoveryConfirmationCount >= 2 && (reclaimedVwap || reclaimedEma21) && edgeQualityScore >= 6.0;
+    recoveryStage = edgeStrong ? 'STRONG TREND PULLBACK' : edgeQualified ? 'TREND PULLBACK CONFIRMED' : 'WAITING FOR 15M PULLBACK';
+  } else if (timeframe === '30m') {
+    edgeSetupType = 'RECOVERY_REVERSAL_30M';
+
+    const dipOk = recent3ReturnPct <= -0.30 && recent3ReturnPct >= -2.50;
+    const exhaustionOk = exhaustionScore >= 4.0 && exhaustionScore <= 7.0;
+    const participationOk = relativeVolume >= 0.75 && relativeVolume <= 4.0;
+    const volatilityOk = atrPct >= 0.35 && atrPct <= 1.50;
+    const breakdownOk = breakdownPenalty > -2.5 && belowLowerBandAtr <= 1.1 && !(lastBearishBody && lastBodyPctAtr > 2.0);
+    const confirmedBearishStructure = structure === 'Bearish Structure';
+    const freshBearishChoch = structure === 'CHOCH (Bearish)' && !reclaimedVwap && !reclaimedEma21 && !structureRecovered;
+    const vwapRecoveryOk = reclaimedVwap || holdsAboveVwap || (vwapDistanceAtr <= 0.45 && reclaimedEma21);
+    const primaryRecovery = reclaimedVwap || reclaimedEma21 || momentumTurnedUp;
+    const recoveryOk = primaryRecovery && recoveryConfirmationCount >= 1;
+    const noFreshBreakdown = !confirmedBearishStructure && !freshBearishChoch;
+
+    if (!dipOk) edgeRejectionReasons.push('30m waiting for a controlled prior pullback (-0.3% to -2.5% over 3 bars)');
+    if (!exhaustionOk) edgeRejectionReasons.push('30m candidate is not in a usable exhaustion zone');
+    if (!participationOk) edgeRejectionReasons.push('30m liquidity/participation outside usable range');
+    if (!volatilityOk) edgeRejectionReasons.push('30m volatility outside usable range');
+    if (!breakdownOk) edgeRejectionReasons.push('30m selloff is still accelerating / breakdown risk');
+    if (confirmedBearishStructure) edgeRejectionReasons.push('30m confirmed Bearish Structure — no long entry');
+    if (freshBearishChoch) edgeRejectionReasons.push('30m bearish CHOCH is WATCH only until a reclaim occurs');
+    if (!primaryRecovery) edgeRejectionReasons.push('30m exhausted but not recovered — wait for VWAP/EMA21 reclaim or momentum turn');
+    if (!vwapRecoveryOk) edgeRejectionReasons.push('30m recovery has not reclaimed/held VWAP');
+
+    const recoveryScore =
+      (reclaimedVwap ? 2.75 : 0) +
+      (holdsAboveVwap ? 1.25 : 0) +
+      (reclaimedEma21 ? 1.5 : 0) +
+      (momentumTurnedUp ? 1.0 : 0) +
+      (structureRecovered ? 0.25 : 0);
+    const contextScore =
+      (dipOk ? 0.8 : 0) +
+      (exhaustionOk ? 0.8 : 0) +
+      (participationOk ? 0.5 : 0) +
+      (volatilityOk ? 0.5 : 0) +
+      (breakdownOk ? 0.8 : 0) +
+      (regime.label === 'BULL' ? 0.5 : regime.label === 'WEAK_BULL' ? 0.35 : regime.label === 'RANGE' ? -0.5 : regime.label === 'BEAR' ? -0.75 : -0.25);
+
+    const recoveryPathScore = recoveryScore + contextScore;
+    const recoveryQualified = dipOk && exhaustionOk && participationOk && volatilityOk && breakdownOk && noFreshBreakdown && recoveryOk && vwapRecoveryOk && recoveryPathScore >= 4.35;
+    const strongRecovery = recoveryConfirmationCount >= 2 && (reclaimedVwap || holdsAboveVwap) && momentumTurnedUp;
+    const strongRecoveryQualified = recoveryQualified && strongRecovery && recoveryPathScore >= 5.75;
+
+    // V5.16: 30m also permits continuation entries. A healthy bull trend should not be
+    // forced to manufacture a fresh exhaustion/reclaim sequence before every entry.
+    const continuationStructureOk = !confirmedBearishStructure && structure !== 'CHOCH (Bearish)';
+    const continuationTrendOk = ema9 > ema21 && ema21 >= ema50 * 0.995 && currentPrice >= ema21;
+    const continuationLocationOk = isAboveVWAP || priceNearVwap || holdsAboveVwap;
+    const continuationMomentumOk = isMacdBullish || momentumTurnedUp || isUTBotBuy;
+    const continuationContextOk = rsi >= 45 && rsi <= 82 && Number(stoch.k) <= 97 && bbPosition <= 1.30;
+    const continuationHardVeto = confirmedBearishStructure || (currentPrice < ema21 && currentPrice < vwap && !isMacdBullish);
+
+    let continuationScore = 0;
+    continuationScore += continuationTrendOk ? 1.75 : -0.75;
+    continuationScore += continuationStructureOk ? 1.20 : -1.25;
+    continuationScore += isAboveVWAP ? 1.20 : (priceNearVwap ? 0.45 : -0.40);
+    continuationScore += isMacdBullish ? 0.85 : (momentumTurnedUp ? 0.45 : -0.20);
+    continuationScore += isUTBotBuy ? 0.55 : -0.15;
+    continuationScore += ichimoku.bias > 0 ? 0.55 : (ichimoku.bias < 0 ? -0.45 : 0);
+    continuationScore += isLinRegBullish ? 0.30 : 0;
+    continuationScore += adxValue >= 20 ? 0.30 : 0;
+    continuationScore += regime.label === 'BULL' ? 0.45 : regime.label === 'WEAK_BULL' ? 0.25 : regime.label === 'BEAR' ? -0.55 : 0;
+    if (rsi > 78) continuationScore -= 0.45;
+    if (Number(stoch.k) > 92) continuationScore -= 0.30;
+    if (bbPosition > 1.15) continuationScore -= 0.30;
+
+    const continuationExtended = rsi > 84 || Number(stoch.k) > 98 || bbPosition > 1.35;
+    const continuationQualified = !continuationHardVeto && continuationTrendOk && continuationLocationOk && continuationMomentumOk && continuationContextOk && continuationScore >= 4.05;
+    const strongContinuationQualified = continuationQualified && !continuationExtended && continuationScore >= 5.35 && isAboveVWAP && (isMacdBullish || momentumTurnedUp);
+
+    edgeQualityScore = Math.max(recoveryPathScore, continuationScore);
+    edgeQualified = recoveryQualified || continuationQualified;
+    edgeStrong = strongRecoveryQualified || strongContinuationQualified;
+
+    if (strongRecoveryQualified) recoveryStage = 'STRONG RECOVERY CONFIRMED';
+    else if (strongContinuationQualified) recoveryStage = 'STRONG 30M TREND CONTINUATION';
+    else if (recoveryQualified) recoveryStage = 'RECOVERY CONFIRMED';
+    else if (continuationQualified) recoveryStage = '30M TREND CONTINUATION';
+    else if (continuationExtended && continuationScore >= 3.35) recoveryStage = 'EXTENDED / WAIT FOR DIP';
+    else if (continuationScore >= 3.10) recoveryStage = 'BULLISH WATCH';
+    else if (dipOk && exhaustionOk) recoveryStage = freshBearishChoch ? 'EXHAUSTED / CHOCH WATCH' : 'EXHAUSTED / WAITING FOR RECLAIM';
+    else recoveryStage = 'NO SETUP';
+
+    if (!edgeQualified && continuationScore < 3.10 && !dipOk) edgeRejectionReasons.push(`30m neither recovery nor continuation qualified (trend score ${continuationScore.toFixed(2)})`);
+  } else if (timeframe === '1h' || timeframe === '2h' || timeframe === '4h' || timeframe === '6h' || timeframe === '8h' || timeframe === '12h' || timeframe === '1d' || timeframe === '3d' || timeframe === '1w') {
+    const strategyMap = {
+      '1h':'CONTROLLED_TREND_1H','2h':'SWING_PULLBACK_2H','4h':'TREND_CONTINUATION_4H','6h':'TREND_CONTINUATION_6H',
+      '8h':'SWING_CONTINUATION_8H','12h':'MACRO_PULLBACK_12H','1d':'MACRO_TREND_1D','3d':'POSITION_TREND_3D','1w':'MACRO_REGIME_1W'
+    };
+    edgeSetupType = strategyMap[timeframe];
+
+    // V5.15: higher-timeframe continuation is scored, not killed by one oscillator.
+    // Overbought RSI/Stoch is a penalty / EXTENDED state, not an automatic rejection.
+    const emaFastUp = ema9 > ema21;
+    const emaMacroUp = ema21 > ema50;
+    const priceAboveMacro = currentPrice > ema50;
+    const structureBullish = /bullish structure|bos \(bullish\)/i.test(structure);
+    const hardBearishVeto = isStructureBearish && currentPrice < ema21 && !isMacdBullish;
+    const severeBreakdownVeto = breakdownPenalty <= -3 && currentPrice < vwap && currentPrice < ema21;
+    const extended = rsi > 80 || Number(stoch.k) > 95 || bbPosition > 1.25;
+
+    let score = 0;
+    score += emaFastUp ? 1.15 : -0.35;
+    score += emaMacroUp ? 1.45 : -0.75;
+    score += priceAboveMacro ? 0.85 : -0.55;
+    score += structureBullish ? 1.25 : (structure === 'CHOP (Ranging)' ? -0.25 : 0.35);
+    score += isMacdBullish ? 0.85 : -0.45;
+    score += isAboveVWAP ? 0.85 : -0.35;
+    score += isUTBotBuy ? 0.55 : -0.25;
+    score += ichimoku.bias > 0 ? 0.55 : (ichimoku.bias < 0 ? -0.55 : 0);
+    score += isLinRegBullish ? 0.35 : -0.15;
+    score += adxValue >= 24 ? 0.45 : (adxValue >= 18 ? 0.15 : -0.15);
+    score += relativeVolume >= 0.55 && relativeVolume <= 4.5 ? 0.30 : -0.20;
+    score += roc9Pct > 0 ? 0.35 : (roc9Pct < -2 ? -0.45 : 0);
+    score += momentumTurnedUp ? 0.35 : 0;
+    if (rsi > 84) score -= 1.20; else if (rsi > 78) score -= 0.55;
+    if (Number(stoch.k) > 97) score -= 0.65; else if (Number(stoch.k) > 90) score -= 0.25;
+    if (bbPosition > 1.35) score -= 0.75; else if (bbPosition > 1.15) score -= 0.30;
+    if (atrPct > 12) score -= 0.75;
+
+    const threshold = timeframe === '1h' ? 5.35 : timeframe === '2h' ? 5.15 : 4.85;
+    const strongThreshold = timeframe === '1h' ? 6.65 : 6.35;
+    edgeQualityScore = score;
+    edgeQualified = !hardBearishVeto && !severeBreakdownVeto && score >= threshold;
+    edgeStrong = edgeQualified && !extended && score >= strongThreshold;
+    recoveryStage = hardBearishVeto || severeBreakdownVeto ? 'BEARISH INVALIDATION' : extended && score >= threshold - 0.75 ? 'EXTENDED / WAIT FOR DIP' : score >= threshold - 1.25 ? 'BULLISH WATCH' : 'NO SETUP';
+    if (!edgeQualified) {
+      if (hardBearishVeto || severeBreakdownVeto) edgeRejectionReasons.push(`${timeframe} bearish invalidation`);
+      else if (extended) edgeRejectionReasons.push(`${timeframe} bullish context is extended; wait for a better entry`);
+      else edgeRejectionReasons.push(`${timeframe} weighted trend score ${score.toFixed(2)} below ${threshold.toFixed(2)}`);
+    }
   } else {
     edgeSetupType = 'UNSUPPORTED_TIMEFRAME';
-    edgeRejectionReasons.push('V5.4 edge profile is calibrated for 30m, 1h and 4h; 5m is confirmation-only');
+    edgeRejectionReasons.push('Unsupported timeframe');
   }
 
   const selectedRejectionReasons = useTimeframeEdgeScoring ? edgeRejectionReasons : (useBreakoutScoring ? breakoutRejectionReasons : (useExhaustionScoring ? exhaustionRejectionReasons : (usePullbackScoring ? pullbackRejectionReasons : rejectionReasons)));
@@ -692,7 +852,15 @@ export function analyzeMarket(ohlcv, options = {}) {
   let finalSignal = 'CASH / NO TRADE ⚪', signalColor = '#94a3b8';
   if (profile === STRATEGY_PROFILES.TIMEFRAME_EDGE_SPOT) {
     if (edgeStrong) { finalSignal = 'STRONG BUY 🚀'; signalColor = '#10b981'; }
-    else if (edgeQualified) { finalSignal = 'BUY 🟢'; signalColor = '#34d399'; }
+    else if (edgeQualified) {
+      if (timeframe === '30m' && recoveryStage.includes('TREND CONTINUATION')) finalSignal = 'TREND BUY 🟢';
+      else finalSignal = ['1h','2h','4h','6h','8h','12h','1d','3d','1w'].includes(timeframe) ? 'TREND BUY 🟢' : 'BUY 🟢';
+      signalColor = '#34d399';
+    }
+    else if (['1m','3m'].includes(timeframe)) { finalSignal = 'EXECUTION ONLY ⚪'; signalColor = '#94a3b8'; }
+    else if (recoveryStage.includes('EXTENDED')) { finalSignal = 'EXTENDED / WAIT FOR DIP 🟠'; signalColor = '#fb923c'; }
+    else if (recoveryStage.includes('BULLISH WATCH')) { finalSignal = 'WATCH / BULLISH 🟡'; signalColor = '#f59e0b'; }
+    else if (['5m','15m','30m'].includes(timeframe) && (recoveryStage.includes('WATCH') || recoveryStage.includes('WAITING'))) { finalSignal = recoveryStage.includes('RECLAIM') ? 'WAIT FOR RECLAIM 🟡' : 'WATCH / NO TRADE 🟡'; signalColor = '#f59e0b'; }
     else if (isStructureBearish || breakdownPenalty <= -2.5) { finalSignal = 'AVOID / CASH 🔴'; signalColor = '#ef4444'; }
   } else if (profile === STRATEGY_PROFILES.V3_BASELINE) {
     if (totalScore >= 5.3 && rsi < 72 && !isStructureBearish) { finalSignal = 'STRONG BUY 🚀'; signalColor = '#10b981'; }
@@ -746,7 +914,7 @@ export function analyzeMarket(ohlcv, options = {}) {
   const tp1Price = currentPrice + Math.max(1.0 * atr, currentPrice * feeBufferPct);
   const tp2Price = currentPrice + Math.max(2.0 * atr, currentPrice * (feeBufferPct + 0.002));
   const tp3Price = currentPrice + Math.max(3.5 * atr, currentPrice * (feeBufferPct + 0.005));
-  const stopPrice = currentPrice - 1.5 * atr;
+  const stopPrice = currentPrice - 2.5 * atr;
   const pct = p => currentPrice ? ((p - currentPrice) / currentPrice) * 100 : 0;
 
   let bbStatus = 'Mid-Range';
@@ -786,6 +954,7 @@ export function analyzeMarket(ohlcv, options = {}) {
     edgeQualityScore: Number(edgeQualityScore.toFixed(2)),
     edgeSetupType, edgeQualified, edgeStrong,
     reversalConfirmationCount: shortReversalConfirmations,
+    recoveryStage, recoveryConfirmationCount, reclaimedVwap, reclaimedEma21, structureRecovered, holdsAboveVwap, momentumTurnedUp, prevStructure,
     regime,
     rejectionReasons: selectedRejectionReasons,
     v4Qualified,
@@ -793,6 +962,8 @@ export function analyzeMarket(ohlcv, options = {}) {
     v4Score: Number(v4TotalScore.toFixed(2)),
     pullbackScore: Number(pullbackTotalScore.toFixed(2)),
     breakoutScore: Number(breakoutScore.toFixed(2)),
+    recommendedStrategy: timeframeStrategy?.label || edgeSetupType,
+    recommendedStrategyCode: timeframeStrategy?.name || edgeSetupType,
     setupType: useTimeframeEdgeScoring ? edgeSetupType : (profile === STRATEGY_PROFILES.MOMENTUM_BREAKOUT_SPOT ? 'MOMENTUM_BREAKOUT' : (usePullbackScoring ? 'TREND_PULLBACK' : (useExhaustionScoring ? 'EXHAUSTION_REVERSAL' : profile))),
     exhaustionScore: Number(exhaustionTotalScore.toFixed(2)),
     exhaustionFeatures: {
@@ -816,7 +987,8 @@ export function analyzeMarket(ohlcv, options = {}) {
       trendGate, structureGate, locationGate, freshPullbackGate, extensionGate, oscillatorGate,
       trendStateScore: Number(pullbackTrendScore.toFixed(2)), pullbackQualityScore: Number(pullbackQualityScore.toFixed(2)),
       reversalConfirmationScore: Number(reversalConfirmationScore.toFixed(2)), pullbackParticipationScore: Number(pullbackParticipationScore.toFixed(2)),
-      extensionPenalty: Number(extensionPenalty.toFixed(2)), breakoutScore: Number(breakoutScore.toFixed(2)), breakoutAbovePriorHighAtr: Number(breakoutAbovePriorHighAtr.toFixed(4))
+      extensionPenalty: Number(extensionPenalty.toFixed(2)), breakoutScore: Number(breakoutScore.toFixed(2)), breakoutAbovePriorHighAtr: Number(breakoutAbovePriorHighAtr.toFixed(4)),
+      recoveryStage, recoveryConfirmationCount, reclaimedVwap, reclaimedEma21, structureRecovered, holdsAboveVwap, momentumTurnedUp, prevStructure
     },
     adxValue: Number(adxValue.toFixed(2)),
     relativeVolume: Number(relativeVolume.toFixed(3)),
@@ -857,6 +1029,8 @@ export function analyzeMarket(ohlcv, options = {}) {
       v4Score: Number(v4TotalScore.toFixed(2)),
     pullbackScore: Number(pullbackTotalScore.toFixed(2)),
     breakoutScore: Number(breakoutScore.toFixed(2)),
+    recommendedStrategy: timeframeStrategy?.label || edgeSetupType,
+    recommendedStrategyCode: timeframeStrategy?.name || edgeSetupType,
     setupType: useTimeframeEdgeScoring ? edgeSetupType : (profile === STRATEGY_PROFILES.MOMENTUM_BREAKOUT_SPOT ? 'MOMENTUM_BREAKOUT' : (usePullbackScoring ? 'TREND_PULLBACK' : (useExhaustionScoring ? 'EXHAUSTION_REVERSAL' : profile))),
     exhaustionScore: Number(exhaustionTotalScore.toFixed(2)),
     exhaustionFeatures: {
@@ -880,7 +1054,8 @@ export function analyzeMarket(ohlcv, options = {}) {
       trendGate, structureGate, locationGate, freshPullbackGate, extensionGate, oscillatorGate,
       trendStateScore: Number(pullbackTrendScore.toFixed(2)), pullbackQualityScore: Number(pullbackQualityScore.toFixed(2)),
       reversalConfirmationScore: Number(reversalConfirmationScore.toFixed(2)), pullbackParticipationScore: Number(pullbackParticipationScore.toFixed(2)),
-      extensionPenalty: Number(extensionPenalty.toFixed(2)), breakoutScore: Number(breakoutScore.toFixed(2)), breakoutAbovePriorHighAtr: Number(breakoutAbovePriorHighAtr.toFixed(4))
+      extensionPenalty: Number(extensionPenalty.toFixed(2)), breakoutScore: Number(breakoutScore.toFixed(2)), breakoutAbovePriorHighAtr: Number(breakoutAbovePriorHighAtr.toFixed(4)),
+      recoveryStage, recoveryConfirmationCount, reclaimedVwap, reclaimedEma21, structureRecovered, holdsAboveVwap, momentumTurnedUp, prevStructure
     },
       strategyProfile: profile,
       regime: regime.label || 'UNKNOWN',
@@ -934,6 +1109,7 @@ export function analyzeMarket(ohlcv, options = {}) {
       edgeQualified, edgeStrong,
       reversalConfirmationCount: shortReversalConfirmations,
       selloffDecelerating,
+      recoveryStage, recoveryConfirmationCount, reclaimedVwap, reclaimedEma21, structureRecovered, holdsAboveVwap, momentumTurnedUp, prevStructure,
       rejectionReasons: selectedRejectionReasons.join(' | '),
       families: {
         trend: Number(selectedTrendScore.toFixed(2)), momentum: Number(selectedMomentumScore.toFixed(2)),

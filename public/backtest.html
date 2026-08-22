@@ -3,14 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Quantitative Screener V5.4 (Timeframe Edge Research)</title>
+    <title>Quantitative Screener V5.15 (Timeframe Router + Recovery Confirmation)</title>
     <link rel="stylesheet" href="/css/styles.css">
 </head>
 <body>
 
 <div class="container">
     <div class="header-bar">
-        <h2>📊 Quantitative Screener V5.4 (Timeframe Edge Research)</h2>
+        <h2>📊 Quantitative Screener V5.15 (Timeframe Router + Recovery Confirmation)</h2>
         <a href="/" style="color: var(--accent); text-decoration: none; font-weight: bold;">← Back to Live Dashboard</a>
     </div>
 
@@ -30,19 +30,26 @@
                 <div>
                     <label>Candle Timeframe</label>
                     <select id="histTimeframe">
-                        <option value="1m">1 Minute</option>
-                        <option value="3m">3 Minutes</option>
-                        <option value="5m">5 Minutes (Confirmation Only in V5.4)</option>
-                        <option value="15m">15 Minutes</option>
-                        <option value="30m" selected>30 Minutes (Exhaustion Reversal)</option>
-                        <option value="1h">1 Hour</option>
-                        <option value="4h">4 Hours</option>
+                        <option value="1m">1 Minute — Execution Only / Fill Timing</option>
+                        <option value="3m">3 Minutes — Execution Only / Micro Confirmation</option>
+                        <option value="5m">5 Minutes — Entry Trigger / Micro Trend</option>
+                        <option value="15m">15 Minutes — Trend Pullback + Reclaim</option>
+                        <option value="30m" selected>30 Minutes — Recovery Reversal</option>
+                        <option value="1h">1 Hour — Controlled Trend / Pullback</option>
+                        <option value="2h">2 Hours — Swing Pullback Continuation</option>
+                        <option value="4h">4 Hours — Trend Continuation</option>
+                        <option value="6h">6 Hours — Trend Continuation / Swing Hold</option>
+                        <option value="8h">8 Hours — Swing Trend Continuation</option>
+                        <option value="12h">12 Hours — Macro Pullback</option>
+                        <option value="1d">1 Day — Macro Trend Continuation</option>
+                        <option value="3d">3 Days — Position Trend / Major Pullback</option>
+                        <option value="1w">1 Week — Macro Regime / Position Bias</option>
                     </select>
                 </div>
                 <div>
                     <label>Strategy Profile</label>
                     <select id="strategyProfile">
-                        <option value="TIMEFRAME_EDGE_SPOT" selected>V5.4 Auto Edge by Timeframe (Recommended)</option>
+                        <option value="TIMEFRAME_EDGE_SPOT" selected>V5.15 Timeframe Router (Recommended)</option>
                         <option value="EXHAUSTION_SCALP_SPOT">Legacy Oversold Exhaustion Spot</option>
                         <option value="TREND_PULLBACK_SPOT">Legacy Trend Pullback Spot</option>
                         <option value="MOMENTUM_BREAKOUT_SPOT">Momentum Breakout Spot</option>
@@ -67,7 +74,7 @@
                 <div>
                     <label>Target Profit Exit Strategy</label>
                     <select id="histTpTarget">
-                        <option value="AUTO" selected>AUTO V5.4 (30m→TP2, 1h/4h→TP3)</option>
+                        <option value="AUTO" selected>AUTO (≤30m→TP2, ≥1h→TP3)</option>
                         <option value="TP2">TP2 (2.0x ATR + Fee Buffer)</option>
                         <option value="TP3">TP3 (3.5x ATR + Fee Buffer)</option>
                         <option value="TP1">TP1 (Research Comparison Only)</option>
@@ -90,12 +97,32 @@
         <div class="spot-banner">
             <label style="cursor: pointer; display: flex; align-items: center; gap: 8px; font-weight: bold; color: var(--success); margin: 0;">
                 <input type="checkbox" id="spotOnlyCheck" onchange="renderHistoricalTable()"> 
-                🎯 SPOT MODE: Show and research only 'Buy' & 'Strong Buy' coins from the interval-start scan
+                🎯 SIGNAL-ONLY TRADES: scan every selected coin for the FULL interval and trade only BUY / STRONG BUY events
             </label>
             <button class="btn-primary" style="background: var(--success); padding: 8px 16px;" onclick="runBatchSimulation()">▶ Run Sequential Per-Coin Research</button>
         </div>
 
         <div id="scanDiagnostics" style="margin-top: 10px; color: var(--text-muted); font-size: 12px;"></div>
+
+        <div id="researchCyclePanel" class="panel" style="margin-top:12px; border:1px solid var(--accent); background:rgba(14,165,233,.06);">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+                <div>
+                    <h3 style="margin:0 0 4px;">🔄 Full-Interval Trade Cycle · SL Width Shadow Study: 1.5× / 2.0× / 2.5× / 3.0× ATR</h3>
+                    <div style="color:var(--text-muted);font-size:13px;">Every selected coin is scanned from start → end. It does not need a signal at the first candle.</div>
+                </div>
+                <div id="cycleStateBadge" style="font-weight:800;padding:8px 12px;border-radius:999px;background:var(--bg-dark);border:1px solid var(--border);">READY</div>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:8px;margin-top:12px;">
+                <div id="cycleStepScan" style="padding:10px;border:1px solid var(--border);border-radius:8px;"><strong>1. SCAN</strong><br><span class="sub-text">Skip candles until BUY</span></div>
+                <div id="cycleStepBuy" style="padding:10px;border:1px solid var(--border);border-radius:8px;"><strong>2. BUY</strong><br><span class="sub-text">Enter on next candle open</span></div>
+                <div id="cycleStepHold" style="padding:10px;border:1px solid var(--border);border-radius:8px;"><strong>3. HOLD</strong><br><span class="sub-text">Keep scanning while in deal</span></div>
+                <div id="cycleStepSell" style="padding:10px;border:1px solid var(--border);border-radius:8px;"><strong>4. SELL</strong><br><span class="sub-text">Sell on confirmed SELL / TP / SL</span></div>
+                <div id="cycleStepRepeat" style="padding:10px;border:1px solid var(--border);border-radius:8px;"><strong>5. REPEAT</strong><br><span class="sub-text">Resume same coin next candle</span></div>
+            </div>
+            <div id="cycleCurrentInfo" style="margin-top:12px;font-size:13px;">No research job running.</div>
+            <div id="cycleEventLog" style="margin-top:8px;max-height:170px;overflow:auto;background:var(--bg-dark);border:1px solid var(--border);border-radius:8px;padding:8px;font-family:monospace;font-size:12px;">No events yet.</div>
+        </div>
+
         <div id="researchProgressPanel" class="indicator-explainer" style="display:none; margin-top:10px;">
             <div style="display:flex; justify-content:space-between; gap:15px; flex-wrap:wrap;">
                 <div>
@@ -116,7 +143,7 @@
         <div id="regimeDiagnostics" class="indicator-explainer" style="display:none; margin-top:10px;"></div>
 
         <div style="margin: 10px 0 4px; color: var(--text-muted); font-size: 12px;">
-            ℹ️ The table below is only a snapshot at the interval start. <strong>Sequential Research</strong> takes exactly one eligible coin at a time, downloads that coin's full interval, scans every candle for BUY signals, enters spot, exits, waits for the next signal, re-enters, and continues until the end. It writes that coin's CSV to disk immediately before moving to the next coin. NO_SIGNALS and DATA_ERROR coins also receive CSV files.
+            ℹ️ The table below is only an optional snapshot at the interval start and does <strong>not</strong> decide which coins are researched. <strong>Sequential Research</strong> queues the full selected universe, takes one coin at a time, downloads its complete interval, scans every candle for BUY / STRONG BUY events, enters spot, exits, resumes scanning that same coin on the next candle, re-enters whenever another valid signal appears, and repeats until the interval ends. Only then is that coin's CSV saved and the next coin begins. NO_SIGNALS and DATA_ERROR coins also receive CSV files.
         </div>
 
         <table>
@@ -128,7 +155,7 @@
                     <th>EMA & VWAP</th>
                     <th>SMC, ADX & System Consensus</th>
                     <th>Consensus Rating</th>
-                    <th>Dynamic Scaled ATR Targets (1.5x SL / Fee-Adjusted TP)</th>
+                    <th>Dynamic Scaled ATR Targets (2.5x SL / Fee-Adjusted TP)</th>
                     <th>Action</th>
                 </tr>
             </thead>

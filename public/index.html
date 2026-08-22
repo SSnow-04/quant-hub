@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Institutional Quant Hub V5.4 — Timeframe Edge Spot</title>
+    <title>Institutional Quant Hub V5.16 — Timeframe Router + Kronos Spot</title>
     <link rel="stylesheet" href="/css/styles.css">
     <script src="/socket.io/socket.io.js"></script>
     <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
@@ -12,7 +12,7 @@
 
 <div class="container">
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-        <h1>⚡ Institutional Quant Hub V5.4 — Timeframe Edge Spot</h1>
+        <h1>⚡ Institutional Quant Hub V5.16 — Timeframe Router + Kronos Spot</h1>
         <a href="/backtest.html" target="_blank" style="background: #8b5cf6; color: white; padding: 10px 18px; border-radius: 6px; text-decoration: none; font-weight: bold; font-size: 14px;">⏩ Launch Backtest Simulator</a>
     </div>
 
@@ -79,7 +79,7 @@
             <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
                 <label style="color: var(--text-muted); font-size: 13px;">Strategy:</label>
                 <select id="liveStrategyProfileSelect" onchange="changeLiveStrategyProfile()" style="padding: 6px 12px; width: auto; display: inline-block;">
-                    <option value="TIMEFRAME_EDGE_SPOT" selected>V5.4 Auto Edge by Timeframe</option>
+                    <option value="TIMEFRAME_EDGE_SPOT" selected>V5.16 Timeframe Router (Auto best-fit logic)</option>
                     <option value="EXHAUSTION_SCALP_SPOT">Legacy Oversold Exhaustion Spot</option>
                     <option value="TREND_PULLBACK_SPOT">Legacy Trend Pullback Spot</option>
                     <option value="MOMENTUM_BREAKOUT_SPOT">Momentum Breakout Spot</option>
@@ -89,22 +89,25 @@
                 </select>
                 <label style="color: var(--text-muted); font-size: 13px;">Timeframe:</label>
                 <select id="timeframeSelect" onchange="changeTimeframe()" style="padding: 6px 12px; width: auto; display: inline-block;">
-                    <option value="1m">1 Minute</option>
-                    <option value="3m">3 Minutes</option>
-                    <option value="5m" selected>5 Minutes (Exhaustion Recommended)</option>
-                    <option value="15m">15 Minutes</option>
-                    <option value="30m">30 Minutes (Pullback Recommended)</option>
-                    <option value="1h">1 Hour</option>
-                    <option value="2h">2 Hours</option>
-                    <option value="4h">4 Hours</option>
-                    <option value="6h">6 Hours</option>
-                    <option value="8h">8 Hours</option>
-                    <option value="12h">12 Hours</option>
-                    <option value="1d">1 Day</option>
-                    <option value="3d">3 Days</option>
-                    <option value="1w">1 Week</option>
+                    <option value="1m">1 Minute — Execution Only / Fill Timing</option>
+                    <option value="3m">3 Minutes — Execution Only / Micro Confirmation</option>
+                    <option value="5m" selected>5 Minutes — Entry Trigger / Micro Trend</option>
+                    <option value="15m">15 Minutes — Trend Pullback + Reclaim</option>
+                    <option value="30m">30 Minutes — Recovery Reversal</option>
+                    <option value="1h">1 Hour — Controlled Trend / Pullback</option>
+                    <option value="2h">2 Hours — Swing Pullback Continuation</option>
+                    <option value="4h">4 Hours — Trend Continuation</option>
+                    <option value="6h">6 Hours — Trend Continuation / Swing Hold</option>
+                    <option value="8h">8 Hours — Swing Trend Continuation</option>
+                    <option value="12h">12 Hours — Macro Pullback</option>
+                    <option value="1d">1 Day — Macro Trend Continuation</option>
+                    <option value="3d">3 Days — Position Trend / Major Pullback</option>
+                    <option value="1w">1 Week — Macro Regime / Position Bias</option>
                 </select>
             </div>
+        </div>
+        <div id="timeframeStrategyHint" class="indicator-explainer" style="margin-bottom:10px; border-left-color:#8b5cf6;">
+            <strong>5m best fit:</strong> Entry Trigger / Micro Trend — use strict reclaim + momentum confirmation; avoid chasing.
         </div>
         <div id="liveRegimeBanner" class="indicator-explainer" style="margin-bottom:15px;">
             <strong>BTC Higher-Timeframe Spot Regime:</strong> waiting for V5 analysis…
@@ -124,7 +127,7 @@
                     <th class="sortable-header" onclick="sortSignals('trend')">EMA & VWAP ⇕</th>
                     <th class="sortable-header" onclick="sortSignals('smc')">SMC, ADX & System Consensus ⇕</th>
                     <th class="sortable-header" onclick="sortSignals('consensus')">Consensus Rating ⇕</th>
-                    <th class="sortable-header" onclick="sortSignals('atr')">Dynamic Scaled ATR Targets (1.5x SL / 1.0x-3.5x TP) ⇕</th>
+                    <th class="sortable-header" onclick="sortSignals('atr')">Dynamic Scaled ATR Targets (2.5x SL / 1.0x-3.5x TP) ⇕</th>
                     <th>Action</th>
                 </tr>
             </thead>
@@ -187,20 +190,20 @@
             <div>
                 <label style="color: var(--text-muted); font-size: 12px; display: block; margin-bottom: 5px;">Timeframe</label>
                 <select id="portfolioTimeframeSelect" onchange="changePortfolioTimeframe()">
-                    <option value="1m">1 Minute</option>
-                    <option value="3m">3 Minutes</option>
-                    <option value="5m" selected>5 Minutes (Exhaustion Recommended)</option>
-                    <option value="15m">15 Minutes</option>
-                    <option value="30m">30 Minutes (Pullback Recommended)</option>
-                    <option value="1h">1 Hour</option>
-                    <option value="2h">2 Hours</option>
-                    <option value="4h">4 Hours</option>
-                    <option value="6h">6 Hours</option>
-                    <option value="8h">8 Hours</option>
-                    <option value="12h">12 Hours</option>
-                    <option value="1d">1 Day</option>
-                    <option value="3d">3 Days</option>
-                    <option value="1w">1 Week</option>
+                    <option value="1m">1 Minute — Execution Only / Fill Timing</option>
+                    <option value="3m">3 Minutes — Execution Only / Micro Confirmation</option>
+                    <option value="5m" selected>5 Minutes — Entry Trigger / Micro Trend</option>
+                    <option value="15m">15 Minutes — Trend Pullback + Reclaim</option>
+                    <option value="30m">30 Minutes — Recovery Reversal</option>
+                    <option value="1h">1 Hour — Controlled Trend / Pullback</option>
+                    <option value="2h">2 Hours — Swing Pullback Continuation</option>
+                    <option value="4h">4 Hours — Trend Continuation</option>
+                    <option value="6h">6 Hours — Trend Continuation / Swing Hold</option>
+                    <option value="8h">8 Hours — Swing Trend Continuation</option>
+                    <option value="12h">12 Hours — Macro Pullback</option>
+                    <option value="1d">1 Day — Macro Trend Continuation</option>
+                    <option value="3d">3 Days — Position Trend / Major Pullback</option>
+                    <option value="1w">1 Week — Macro Regime / Position Bias</option>
                 </select>
             </div>
             <div>
@@ -238,7 +241,7 @@
                     <th>Consensus Rating</th>
                     <th>Selected Target Upside</th>
                     <th>Assigned Capital ($)</th>
-                    <th>Target Stop Loss (-1.5x ATR)</th>
+                    <th>Target Stop Loss (-2.5x ATR)</th>
                     <th>Limit Take Profit Exit</th>
                 </tr>
             </thead>
